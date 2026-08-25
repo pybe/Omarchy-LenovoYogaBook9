@@ -259,6 +259,8 @@ sudo pacman -S --needed iio-sensor-proxy python-gobject
 sudo systemctl enable --now iio-sensor-proxy
 install -Dm755 bin/yoga-autobrightness ~/.local/bin/yoga-autobrightness
 install -Dm755 bin/yoga-autobrightness-osd ~/.local/bin/yoga-autobrightness-osd
+install -Dm755 bin/yoga-mode ~/.local/bin/yoga-mode
+install -Dm755 bin/yoga-orientation ~/.local/bin/yoga-orientation
 install -Dm644 config/yoga-autobrightness.conf ~/.config/yoga-autobrightness.conf
 install -Dm644 config/systemd/yoga-autobrightness.service \
   ~/.config/systemd/user/yoga-autobrightness.service
@@ -313,6 +315,51 @@ That writes `show_osd` to `~/.config/yoga-autobrightness.conf`, which the daemon
 
 ---
 
+## Display modes
+
+This machine gets used in genuinely different physical arrangements, and one of them cannot be detected by any sensor. [`bin/yoga-mode`](bin/yoga-mode) switches between them:
+
+```bash
+yoga-mode stand        # stacked landscape — the everyday layout
+yoga-mode book         # turned 90°, two portrait screens side by side
+yoga-mode book-flip    # book, turned the other way
+yoga-mode present      # mirrored, upper panel facing the person opposite
+yoga-mode cycle        # step through them
+```
+
+`book-flip` exists because which way you rotate the machine depends on where your cables are, and the two directions are not interchangeable.
+
+`present` mirrors the lower panel onto the upper one and sets the upper panel to `transform = 0` — upside down to you, correct way up to whoever you are showing it to. Hyprland does apply a transform to a mirroring output, so this works.
+
+### Things that will catch you out
+
+**`eDP-1`'s transform is always `eDP-2`'s plus 2 (mod 4)**, in every mode, because the upper panel is mounted 180° out. That is why the numbers look asymmetric.
+
+**Clear `mirror` explicitly in every non-mirroring mode.** Set once, it persists — and because `hyprctl monitors` *hides* mirrored outputs, the panel appears to have vanished entirely rather than merely being mirrored. Use `hyprctl monitors all` when a monitor seems to disappear.
+
+**`hyprctl keyword` does not work** under Omarchy's Lua parser; these go through `hyprctl eval`.
+
+### Auto-rotation: partly possible, and why it is not automatic
+
+The accelerometer works well. All four orientations report reliably, along with tilt:
+
+```
+normal   right-up   left-up   bottom-up
+vertical tilted-down tilted-up face-down
+```
+
+Inspect it live with [`bin/yoga-orientation`](bin/yoga-orientation), which also records to `/tmp/yoga-orientation.log`.
+
+**The hinge sensor is dead.** `iio:device4` exposes three angles — `hinge`, `screen`, `keyboard` — with a trigger and a settable sampling frequency, and every one of them reads `0` permanently, unchanged while the screen is moved through its full range. Enabling its IIO buffer changes nothing, and `iio-sensor-proxy` does not expose it at all. The firmware never populates it.
+
+That matters because the hinge angle is what would distinguish "folded into a tablet" from "picked the laptop up and tilted it". Without it, orientation alone cannot tell a deliberate mode change from incidental movement.
+
+And **present mode is not an orientation at all** — it is a choice about who is looking. No sensor can infer it.
+
+So mode switching is manual by design. Auto-rotation could reasonably be layered on for the book positions, with a stability delay, but it can never cover all three modes.
+
+---
+
 ## Applying all of it
 
 ```bash
@@ -346,6 +393,8 @@ sudo pacman -S --needed iio-sensor-proxy python-gobject
 sudo systemctl enable --now iio-sensor-proxy
 install -Dm755 bin/yoga-autobrightness ~/.local/bin/yoga-autobrightness
 install -Dm755 bin/yoga-autobrightness-osd ~/.local/bin/yoga-autobrightness-osd
+install -Dm755 bin/yoga-mode ~/.local/bin/yoga-mode
+install -Dm755 bin/yoga-orientation ~/.local/bin/yoga-orientation
 install -Dm644 config/yoga-autobrightness.conf ~/.config/yoga-autobrightness.conf
 install -Dm644 config/systemd/yoga-autobrightness.service \
   ~/.config/systemd/user/yoga-autobrightness.service

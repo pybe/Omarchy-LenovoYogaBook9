@@ -1,0 +1,78 @@
+#!/bin/bash
+
+# Switch the Yoga Book 9's two panels between physical usage modes.
+#
+# eDP-1 is the upper panel and is mounted 180 degrees out, so every transform
+# for it is the one eDP-2 needs plus 2 (mod 4). That relationship holds in
+# every mode and is why the numbers below look asymmetric.
+#
+# hyprctl keyword does not work under Omarchy's Lua config parser -- these go
+# through hyprctl eval instead.
+#
+# Every non-mirroring mode sets mirror = "none" explicitly. Without it the
+# mirror set by present mode persists into the others, and since
+# `hyprctl monitors` HIDES mirrored outputs the panel appears to have vanished
+# rather than merely being mirrored -- use `hyprctl monitors all` to see it.
+
+set -u
+
+MODE_FILE="${XDG_RUNTIME_DIR:-/tmp}/yoga-mode"
+MODE="2880x1800@60"
+
+apply() { hyprctl eval "$1" >/dev/null 2>&1; }
+
+# Stand / laptop: stacked landscape, upper above lower. The everyday layout.
+mode_stand() {
+  apply "hl.monitor({ output = \"eDP-1\", mode = \"$MODE\", position = \"0x0\",   scale = 2, transform = 2, mirror = \"none\" })"
+  apply "hl.monitor({ output = \"eDP-2\", mode = \"$MODE\", position = \"0x900\", scale = 2, transform = 0, mirror = \"none\" })"
+}
+
+# Book: machine turned 90 degrees, two portrait screens side by side.
+# 900x1440 logical each once rotated, so the right-hand panel starts at x=900.
+mode_book() {
+  apply "hl.monitor({ output = \"eDP-2\", mode = \"$MODE\", position = \"0x0\",   scale = 2, transform = 1, mirror = \"none\" })"
+  apply "hl.monitor({ output = \"eDP-1\", mode = \"$MODE\", position = \"900x0\", scale = 2, transform = 3, mirror = \"none\" })"
+}
+
+# Book, turned the other way. Which direction you rotate depends on where the
+# ports and cables are, so both are provided. Every panel gains 180 degrees
+# relative to mode_book, and the two swap sides.
+mode_book_flip() {
+  apply "hl.monitor({ output = \"eDP-1\", mode = \"$MODE\", position = \"0x0\",   scale = 2, transform = 1, mirror = \"none\" })"
+  apply "hl.monitor({ output = \"eDP-2\", mode = \"$MODE\", position = \"900x0\", scale = 2, transform = 3, mirror = \"none\" })"
+}
+
+# Present: mirrored, upper panel facing the person opposite. The upper panel
+# drops to transform 0 -- upside down to you, correct way up to them.
+mode_present() {
+  apply "hl.monitor({ output = \"eDP-2\", mode = \"$MODE\", position = \"0x0\", scale = 2, transform = 0 })"
+  apply "hl.monitor({ output = \"eDP-1\", mode = \"$MODE\", position = \"0x0\", scale = 2, transform = 0, mirror = \"eDP-2\" })"
+}
+
+current() { cat "$MODE_FILE" 2>/dev/null || echo stand; }
+
+notify() {
+  command -v omarchy-notification-send >/dev/null &&
+    omarchy-notification-send -u low "Display mode: $1"
+  echo "display mode: $1"
+}
+
+case "${1:-cycle}" in
+stand | laptop) mode_stand;   echo stand   > "$MODE_FILE"; notify stand ;;
+book)               mode_book;      echo book      > "$MODE_FILE"; notify "book" ;;
+book-flip | book2)  mode_book_flip; echo book-flip > "$MODE_FILE"; notify "book (other way)" ;;
+present | tent) mode_present; echo present > "$MODE_FILE"; notify present ;;
+cycle)
+  case "$(current)" in
+  stand)     "$0" book ;;
+  book)      "$0" book-flip ;;
+  book-flip) "$0" present ;;
+  *)         "$0" stand ;;
+  esac
+  ;;
+status) current ;;
+*)
+  echo "usage: ${0##*/} [stand|book|book-flip|present|cycle|status]" >&2
+  exit 1
+  ;;
+esac

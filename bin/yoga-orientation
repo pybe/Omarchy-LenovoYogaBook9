@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""Print orientation live. Ctrl-C to stop.
+
+Run it, then move the machine into each position you care about and note what
+it reports. Auto-rotation can only be as good as what this shows.
+"""
+import gi, time, sys
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib
+
+bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+bus.call_sync("net.hadess.SensorProxy", "/net/hadess/SensorProxy",
+              "net.hadess.SensorProxy", "ClaimAccelerometer", None, None,
+              Gio.DBusCallFlags.NONE, -1, None)
+
+def prop(name):
+    v = bus.call_sync("net.hadess.SensorProxy", "/net/hadess/SensorProxy",
+        "org.freedesktop.DBus.Properties", "Get",
+        GLib.Variant("(ss)", ("net.hadess.SensorProxy", name)),
+        None, Gio.DBusCallFlags.NONE, -1, None)
+    return v.unpack()[0]
+
+def raw(axis):
+    try:
+        with open(f"/sys/bus/iio/devices/iio:device2/in_accel_{axis}_raw") as f:
+            return int(f.read())
+    except OSError:
+        return 0
+
+LOG = "/tmp/yoga-orientation.log"
+log = open(LOG, "w", buffering=1)
+print(f"Move the machine into each position you use. Ctrl-C when done.")
+print(f"Recording to {LOG}\n")
+print(f"{'orientation':<14}{'tilt':<12}{'accel x/y/z':<28}{'hinge':<8}")
+try:
+    while True:
+        try:
+            with open("/sys/bus/iio/devices/iio:device4/in_angl0_raw") as f:
+                hinge = f.read().strip()
+        except OSError:
+            hinge = "n/a"
+        axes = f"{raw('x'):>7} {raw('y'):>8} {raw('z'):>8}"
+        line = (f"{prop('AccelerometerOrientation'):<14}"
+                f"{prop('AccelerometerTilt'):<12}{axes:<28}{hinge:<8}")
+        print(line, flush=True)
+        log.write(line + "\n")
+        time.sleep(1)
+except KeyboardInterrupt:
+    pass
+finally:
+    bus.call_sync("net.hadess.SensorProxy", "/net/hadess/SensorProxy",
+                  "net.hadess.SensorProxy", "ReleaseAccelerometer", None, None,
+                  Gio.DBusCallFlags.NONE, -1, None)
+    log.close()
+    print(f"\nstopped — recorded to {LOG}")
