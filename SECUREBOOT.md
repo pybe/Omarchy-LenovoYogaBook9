@@ -1,6 +1,6 @@
 # Secure Boot and TPM unlock
 
-**Status: keys enrolled, Secure Boot not yet switched on.** Everything is signed and the firmware holds our keys plus Microsoft's. The remaining step is enabling Secure Boot in the BIOS.
+**Status: Secure Boot enabled and verified. TPM enrolled and the initramfs switched — awaiting a reboot to confirm auto-unlock.**
 
 ## Why bother
 
@@ -87,7 +87,7 @@ actual=$(b2sum /boot/EFI/Linux/omarchy_linux.efi | cut -d' ' -f1)
 1. ~~**BIOS:** clear/erase keys to reach Setup Mode, leaving Secure Boot off.~~ **Done.** On this Insyde firmware the option sits under Security → Secure Boot. `sbctl status` then reported `Setup Mode: Enabled`, `Vendor Keys: none`.
 2. ~~**Enrol:** `sbctl enroll-keys -m`.~~ **Done.** The `-m` keeps Microsoft's vendor keys, which matters on a Lenovo — firmware capsule updates and option ROMs are signed with them, and dropping them can break firmware updates. Status afterwards: `Setup Mode: Disabled`, `Vendor Keys: microsoft`.
 3. **BIOS again:** enable Secure Boot. Confirm with `bootctl status` (`Secure Boot: enabled`) or `sbctl status`. **← next**
-4. **TPM:** then, and only then, enrol the TPM for LUKS. That needs the initramfs switched from the `encrypt` hook to `sd-encrypt`, the `cryptdevice=` parameter replaced with `rd.luks.*`, and `systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7`. PCR 7 is the Secure Boot state, which is the whole point of doing it in this order. Keep the passphrase keyslot as a fallback.
+4. ~~**TPM:**~~ **Done, pending reboot.** See below. That needs the initramfs switched from the `encrypt` hook to `sd-encrypt`, the `cryptdevice=` parameter replaced with `rd.luks.*`, and `systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7`. PCR 7 is the Secure Boot state, which is the whole point of doing it in this order. Keep the passphrase keyslot as a fallback.
 
 Keep a USB keyboard attached throughout: firmware setup and the LUKS prompt both need one.
 
@@ -104,3 +104,60 @@ Setup Mode:   disabled          <- must become enabled before enrolling
 Vendor Keys:  microsoft builtin-db builtin-db builtin-PK
 TPM2:         present (/dev/tpm0), LUKS2 root, no TPM token enrolled
 ```
+
+
+## TPM unlock
+
+Enrol the TPM against PCR 7 (Secure Boot state — the reason for doing Secure Boot first). This needs the existing passphrase typed interactively, and it **adds** a keyslot rather than replacing one, so the passphrase remains as a fallback:
+
+```bash
+sudo systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7 /dev/nvme0n1p2
+```
+
+Confirm with `cryptsetup luksDump` — expect two keyslots and a `systemd-tpm2` token:
+
+```
+Keyslots:  0: luks2      1: luks2
+Tokens:    0: systemd-tpm2
+```
+
+The busybox `encrypt` hook cannot talk to a TPM, so the initramfs must move to `sd-encrypt`. Omarchy's hooks live in `/etc/mkinitcpio.conf.d/omarchy_hooks.conf`; rather than editing that package-managed file, add a later-sorting drop-in — `zz-sd-encrypt.conf` — which wins because mkinitcpio sources drop-ins in sort order:
+
+```bash
+HOOKS=(base systemd plymouth autodetect microcode modconf kms keyboard sd-vconsole block sd-encrypt filesystems fsck btrfs-overlayfs)
+```
+
+`udev` becomes `systemd`, `keymap`+`consolefont` become `sd-vconsole`, `encrypt` becomes `sd-encrypt`. The `resume` hook that `omarchy_resume.conf` appends is dropped deliberately: under the systemd hook, hibernation resume is handled by `systemd-hibernate-resume-generator` from the `resume=` parameter, which is still supplied.
+
+Then swap the root parameter in `/etc/default/limine`:
+
+```
+cryptdevice=PARTUUID=<part>:root   ->   rd.luks.name=<luks-uuid>=root
+```
+
+Rebuild and re-sign, minding the hash ordering described above:
+
+```bash
+limine-mkinitcpio     # rebuilds the UKI, rewrites limine.conf
+sbctl sign-all
+limine-update         # rewrite hashes to describe the signed UKI
+sbctl sign -s /boot/EFI/BOOT/BOOTX64.EFI   # limine-update stripped this
+sbctl verify
+```
+
+### The UKI carries no embedded command line
+
+Worth knowing before assuming a UKI implies a signed command line. On this setup it does not:
+
+```
+$ objdump -h /boot/EFI/Linux/omarchy_linux.efi
+  .osrel   .linux   .initrd        <- no .cmdline
+```
+
+limine passes the command line externally via `cmdline:` entries in `limine.conf`, and that is honoured even with Secure Boot enabled — confirmed by `/proc/cmdline` matching limine's entry on a Secure Boot run. This is deliberate on limine-snapper-sync's part: snapshot entries need to override `rootflags=subvol=`, which an embedded command line would forbid.
+
+**Security consequence, stated plainly.** `limine.conf` is not signed. Anyone with physical access can edit the command line it passes, and PCR 7 only measures Secure Boot policy — not the command line — so the TPM would still release the key. TPM unlock here therefore protects a stolen drive well, and protects less against someone who has the whole machine. Binding additional PCRs, or accepting a TPM PIN, would tighten it at the cost of convenience. Not done here.
+
+### Rollback
+
+The Snapshots entry points at the previous UKI in `limine_history`, paired with the old `cryptdevice=` command line, and that image is signed. Old kernel, old initramfs, old parameter — a matched set, so it boots and prompts for the passphrase. Keep a USB keyboard around for it: Bluetooth still will not work at that prompt.
