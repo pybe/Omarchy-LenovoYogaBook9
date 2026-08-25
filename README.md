@@ -209,7 +209,24 @@ wpctl inspect @DEFAULT_AUDIO_SINK@ | grep audio.channels    # expect 4
 
 Bass returns immediately. Pure userspace, no kernel patch, survives kernel updates.
 
-For further shaping, install `easyeffects` — a PipeWire equaliser that can tune the low end to taste.
+### Tone correction on top
+
+Feeding the woofers fixes the missing bass, but these are small drivers in a thin chassis and still sound light. [`config/pipewire/60-bass-boost.conf`](config/pipewire/60-bass-boost.conf) adds a fixed low shelf and a small upper-mid trim using PipeWire's **built-in** biquad filters — no plugins, no application running, loaded at startup:
+
+```bash
+install -Dm644 config/pipewire/60-bass-boost.conf \
+  ~/.config/pipewire/pipewire.conf.d/60-bass-boost.conf
+systemctl --user restart pipewire pipewire-pulse wireplumber
+wpctl set-default $(pw-dump | jq -r '.[]|select(.info.props."node.name"?=="bass_boost_sink")|.id')
+```
+
+Edit the `Gain` values and restart PipeWire to taste. Keep it modest — large boosts on small drivers give distortion, not depth.
+
+> **If you install `easyeffects` instead, install its plugins too.** On Arch the equaliser lives in `lsp-plugins-lv2`, which is an *optional* dependency. Install `easyeffects` alone and the Equalizer appears in the pipeline as `ee_soe_equalizer` but with **no controls and no audible effect** — a convincing imitation of a broken audio stack. Check with `pacman -Qi easyeffects | grep -A6 'Optional Deps'`; you likely want `lsp-plugins-lv2 calf mda.lv2 zam-plugins-lv2`.
+>
+> Two further traps: EasyEffects quits when its window closes unless configured otherwise, and it only processes audio routed into `easyeffects_sink` — if it is not the default output, its controls do nothing at all. Verify with `pw-link -l | grep ee_soe_`.
+>
+> Note also that EasyEffects is a mixing-desk-grade tool (filter modes, IIR/FIR, per-band Q). If you want a phone-style slider bank with named presets, `jamesdsp` (AUR) is closer in spirit.
 
 > **A test that proves nothing.** Stopping PipeWire to run `speaker-test -D plughw:0,0 -c 4` gives total silence on *all four* channels, including the ones that normally work. Stopping PipeWire tears down the UCM routing, so the output path is disabled. Do not read that silence as evidence about the woofers — test with PipeWire running instead.
 
