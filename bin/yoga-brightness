@@ -1,0 +1,27 @@
+#!/bin/bash
+
+# Drive both internal panels of the Yoga Book 9 from one brightness command.
+#
+# omarchy-hw-display walks a fixed preference list and returns intel_backlight
+# (eDP-1), so the stock brightness keys never see the second panel's backlight
+# and eDP-2 stays wherever it was last left. This runs the stock command for
+# eDP-1 plus the OSD, then mirrors the resulting level onto eDP-2.
+
+PRIMARY=intel_backlight
+SECONDARY=card1-eDP-2-backlight
+
+omarchy-brightness-display "$@"
+
+# No brightness argument means the stock command only printed a value.
+(($# > 0)) || exit 0
+case "${*: -1}" in
+--no-osd | off | on) exit 0 ;;
+esac
+
+# An external DDC monitor being focused must not drag eDP-2 along with it.
+focused="$(omarchy-hyprland-monitor-focused 2>/dev/null || true)"
+[[ $focused =~ ^(eDP|LVDS|DSI)- ]] || exit 0
+
+pct="$(brightnessctl -d "$PRIMARY" -m 2>/dev/null | awk -F, '{ gsub("%", "", $4); print $4 }')"
+[[ -n $pct ]] || exit 0
+brightnessctl -d "$SECONDARY" set "$pct%" >/dev/null
