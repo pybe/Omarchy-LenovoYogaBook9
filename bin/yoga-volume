@@ -1,0 +1,128 @@
+#!/bin/bash
+
+# Volume control that can see past a DSP sink built on PipeWire links.
+#
+# Omarchy deliberately reaches through DSP sinks to the physical one, so the
+# keys move real loudness and the processing always sees full-scale input.
+# omarchy-audio-output-sink does that by finding a PulseAudio *sink-input*
+# whose node.name starts with the DSP sink's name, plus a hardcoded case for
+# EasyEffects. JamesDSP has no such sink-input -- it feeds the hardware sink
+# over raw PipeWire links, invisible to `pactl list sink-inputs` -- so the
+# resolver returns jamesdsp_sink itself and the keys adjust a volume JamesDSP
+# ignores. The OSD moves and nothing is heard.
+#
+# This resolves through PipeWire links instead, and falls back to Omarchy's
+# resolver so behaviour is never worse than the stock path.
+
+set -uo pipefail
+
+OSD_ICON_VOLUME=volume
+OSD_ICON_MUTED=volume-muted
+
+# The ALSA sink that a DSP sink ultimately feeds.
+#
+# Not a single hop. JamesDSP's chain is:
+#   jamesdsp_sink:monitor_FL  ->  jdsp_@PwJamesDspPlugin_JamesDsp:input_FL
+#   jdsp_@...:output_FL       ->  alsa_output...Speaker__sink:playback_FL
+# so the sink apps write to never links directly to hardware. Walk the graph
+# outward instead, which also covers EasyEffects and plain filter-chains
+# without knowing anything about them.
+resolve_via_pipewire() {
+  pw-link -l 2>/dev/null | python3 -c '
+import sys
+
+edges, cur = {}, None
+for line in sys.stdin:
+    if not line[:1].isspace():
+        cur = line.strip().split(":")[0]
+    elif line.strip().startswith("|->") and cur:
+        tgt = line.strip()[3:].strip().split(":")[0]
+        edges.setdefault(cur, set()).add(tgt)
+
+start = sys.argv[1]
+seen, frontier = {start}, [start]
+for _ in range(6):                       # bounded: never loop on a cycle
+    nxt = []
+    for node in frontier:
+        for peer in edges.get(node, ()):
+            if peer.startswith("alsa_output."):
+                print(peer)
+                raise SystemExit(0)
+            if peer not in seen:
+                seen.add(peer)
+                nxt.append(peer)
+    frontier = nxt
+' "$1"
+}
+
+physical_sink() {
+  local sink
+  sink="$(pactl get-default-sink 2>/dev/null)"
+
+  # Already physical: nothing to resolve.
+  if [[ -z $sink || $sink == alsa_output.* ]]; then
+    printf '%s\n' "$sink"
+    return
+  fi
+
+  local resolved
+  resolved="$(resolve_via_pipewire "$sink")"
+  if [[ -n $resolved ]] && pactl list sinks short 2>/dev/null | grep -q "[[:space:]]$resolved[[:space:]]"; then
+    printf '%s\n' "$resolved"
+    return
+  fi
+
+  # Fall back to Omarchy's own resolver rather than doing something worse.
+  omarchy-audio-output-sink 2>/dev/null || printf '%s\n' "$sink"
+}
+
+volume_percent() {
+  pactl get-sink-volume "$1" 2>/dev/null |
+    awk 'NR == 1 { for (i = 1; i <= NF; i++) if ($i ~ /%$/) { sub("%", "", $i); print $i; exit } }'
+}
+
+muted() { [[ $(pactl get-sink-mute "$1" 2>/dev/null) == *yes ]]; }
+
+show_osd() {
+  local sink="$1" pct icon
+  pct="$(volume_percent "$sink")"
+  if muted "$sink"; then icon="$OSD_ICON_MUTED"; else icon="$OSD_ICON_VOLUME"; fi
+  command -v omarchy-osd >/dev/null && omarchy-osd -i "$icon" -p "${pct:-0}" >/dev/null 2>&1
+}
+
+action="${1:-}"
+[[ -n $action ]] || { echo "usage: ${0##*/} <raise|lower|mute-toggle|+N|-N>" >&2; exit 1; }
+
+sink="$(physical_sink)"
+[[ -n $sink ]] || { echo "could not resolve an audio sink to control" >&2; exit 1; }
+
+case "$action" in
+raise) action="+5" ;;
+lower) action="-5" ;;
+esac
+
+if [[ $action == "mute-toggle" ]]; then
+  # Same 250ms debounce as Omarchy: key repeat otherwise toggles twice.
+  debounce="${XDG_RUNTIME_DIR:-/tmp}/yoga-volume-mute.last"
+  now=$(date +%s%3N)
+  last=0
+  [[ -r $debounce ]] && read -r last <"$debounce" || true
+  ((now - last < 250)) && exit 0
+  printf '%s\n' "$now" >"$debounce"
+  pactl set-sink-mute "$sink" toggle
+elif [[ $action =~ ^([+-])([0-9]+)$ ]]; then
+  dir="${BASH_REMATCH[1]}"
+  step="${BASH_REMATCH[2]}"
+  cur="$(volume_percent "$sink")"
+  [[ -n $cur ]] || { echo "could not read volume for $sink" >&2; exit 1; }
+  if [[ $dir == "+" ]]; then target=$((cur + step)); else target=$((cur - step)); fi
+  ((target < 0)) && target=0
+  ((target > 100)) && target=100
+  pactl set-sink-mute "$sink" 0
+  pactl set-sink-volume "$sink" "${target}%"
+else
+  echo "usage: ${0##*/} <raise|lower|mute-toggle|+N|-N>" >&2
+  exit 1
+fi
+
+show_osd "$sink"

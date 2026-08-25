@@ -400,6 +400,61 @@ It reads the layout back from `hyprctl monitors` rather than trusting a recorded
 
 ---
 
+## Volume keys do nothing with a DSP sink
+
+### What you see
+
+The on-screen volume slider moves. Loudness does not change. Affects `jamesdsp`, which this repo recommends as the equaliser.
+
+### Why
+
+Omarchy deliberately reaches *through* a DSP sink to the physical one, so the keys move real loudness and the processing always sees full-scale input. The intent is right; the resolution fails.
+
+`omarchy-audio-output-sink` follows a DSP sink downstream by looking for a **PulseAudio sink-input** whose `node.name` starts with the DSP sink's name, with a hardcoded case for EasyEffects. JamesDSP has no such sink-input — it reaches the hardware over raw PipeWire links, which `pactl list sink-inputs` cannot see:
+
+```
+$ pactl list sink-inputs
+Sink Input #1347
+    Sink: 70                     <- jamesdsp_sink
+    application.name = "Chromium"
+```
+
+That is the only sink-input on the system. So the resolver falls through and returns the DSP sink itself, and the keys set a volume JamesDSP ignores.
+
+**The chain is two hops, not one** — worth knowing, because a naive one-hop lookup also fails:
+
+```
+jamesdsp_sink:monitor_FL                   |-> jdsp_@PwJamesDspPlugin_JamesDsp:input_FL
+jdsp_@PwJamesDspPlugin_JamesDsp:output_FL  |-> alsa_output...Speaker__sink:playback_FL
+```
+
+The sink applications write to never links directly to hardware; its *monitor* feeds a separate processing node which does.
+
+### Fix
+
+[`bin/yoga-volume`](bin/yoga-volume) resolves by walking the PipeWire graph outward from the default sink until it reaches an `alsa_output.*`, bounded to six hops. That covers JamesDSP, EasyEffects and plain filter-chains without knowing anything about them, and falls back to `omarchy-audio-output-sink` so behaviour is never worse than stock.
+
+Five keys are rebound in `input.lua`'s sibling [`bindings.lua`](config/hypr/bindings.lua) — raise, lower, mute, and the two ALT precise variants — each `hl.unbind`'d first. `SHIFT + XF86AudioMute` is the output switcher, not volume, and is left alone.
+
+### Levels matter as much as the fix
+
+Getting the resolution right is only half of it. Both stages attenuating sounds worse than either problem:
+
+```
+jamesdsp_sink : 0.15    <- EQ starved of signal
+hardware      : 21%     <- then attenuated again
+```
+
+Thin, and poor signal-to-noise. Set the DSP sink to **unity** and let the keys control the hardware:
+
+```bash
+wpctl set-volume <jamesdsp_sink id> 1.0
+```
+
+JamesDSP has its own limiter (`master_limthreshold`, `master_limrelease` in `~/.config/jamesdsp/audio.conf`) precisely so it can take a full-scale signal without clipping — which is the assumption Omarchy's design rests on.
+
+---
+
 ## Applying all of it
 
 ```bash
