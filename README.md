@@ -155,6 +155,66 @@ Binding to an output fixes both problems at once: input goes to the right screen
 
 ---
 
+## Quirk 5 — no bass: the woofers are never fed
+
+### What you see
+
+Sound is thin and treble-heavy at any volume. Nothing is muted and volume behaves normally — there is simply no low end.
+
+### Why
+
+The codec presents two speaker pins, and the kernel classifies them as **front and surround** rather than tweeters and woofers:
+
+```
+Node 0x17  "Speaker Playback Switch"       <- tweeters, fed by DAC 0x03
+Node 0x14  "Bass Speaker Playback Switch"  <- woofers,  fed by DAC 0x02
+```
+
+The driver also creates `Speaker Front Phantom Jack` **and** `Speaker Surround Phantom Jack`, which gives the game away. A stereo stream only ever reaches the front DAC, so `0x14` receives nothing and the woofers stay silent.
+
+Confirm it in seconds — with music playing, mute only the main speakers:
+
+```bash
+amixer -c 0 cset numid=7 off    # Speaker (0x17) off
+amixer -c 0 cset numid=9 on     # Bass Speaker (0x14) on
+```
+
+Total silence means the woofers are getting nothing. Turn `numid=7` back on afterwards.
+
+Everything in the mixer looks correct, which is what makes this confusing: `Bass Speaker Playback Switch` is on, `DAC2 Playback Volume` is at maximum, the pin has `Pin-ctls: 0x40: OUT` and EAPD asserted. The problem is upstream of the mixer.
+
+Related, and probably the same root cause — no model-specific codec quirk matched:
+
+```
+snd_hda_codec_alc269 ehdaudio0D0: ALC287: picked fixup  for PCI SSID 17aa:3843
+```
+
+Note the blank fixup name. The kernel does contain `ALC287_FIXUP_LENOVO_YOGA_BOOK_9I`, but it has no model string, so it cannot be forced with a module parameter — it only applies via the SSID quirk table.
+
+### Fix
+
+Rather than patch the kernel, open the sink with four channels so the surround pair carries audio, and upmix to generate it. Drop [this file](config/wireplumber/51-yoga-bass-speakers.conf) into `~/.config/wireplumber/wireplumber.conf.d/` and restart WirePlumber:
+
+```
+audio.channels = 4
+audio.position = [ FL, FR, RL, RR ]
+channelmix.upmix = true
+channelmix.upmix-method = psd
+```
+
+```bash
+systemctl --user restart wireplumber
+wpctl inspect @DEFAULT_AUDIO_SINK@ | grep audio.channels    # expect 4
+```
+
+Bass returns immediately. Pure userspace, no kernel patch, survives kernel updates.
+
+For further shaping, install `easyeffects` — a PipeWire equaliser that can tune the low end to taste.
+
+> **A test that proves nothing.** Stopping PipeWire to run `speaker-test -D plughw:0,0 -c 4` gives total silence on *all four* channels, including the ones that normally work. Stopping PipeWire tears down the UCM routing, so the output path is disabled. Do not read that silence as evidence about the woofers — test with PipeWire running instead.
+
+---
+
 ## Applying all of it
 
 ```bash
@@ -162,6 +222,11 @@ git clone https://github.com/pybe/Omarchy-LenovoYogaBook9
 cd Omarchy-LenovoYogaBook9
 
 install -Dm755 bin/yoga-brightness ~/.local/bin/yoga-brightness
+
+# Quirk 5 — bass speakers
+install -Dm644 config/wireplumber/51-yoga-bass-speakers.conf \
+  ~/.config/wireplumber/wireplumber.conf.d/51-yoga-bass-speakers.conf
+systemctl --user restart wireplumber
 
 # Back up first — these append to existing files.
 for f in monitors bindings autostart input; do
