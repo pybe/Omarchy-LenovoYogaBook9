@@ -222,19 +222,29 @@ wpctl set-default $(pw-dump | jq -r '.[]|select(.info.props."node.name"?=="bass_
 
 Edit the `Gain` values and restart PipeWire to taste. Keep it modest — large boosts on small drivers give distortion, not depth.
 
-### If you want a graphical equaliser instead
+### If you want a graphical equaliser
 
-Two options, and they suit different people.
+**Use [`jamesdsp`](https://aur.archlinux.org/packages/jamesdsp) (AUR).** It is a port of the Android app: a slider bank, a bass control, named presets. It works the way an equaliser on a phone, TV or car stereo works, which is what most people actually want.
 
-**`easyeffects`** is the usual recommendation and a genuinely capable tool — but it is aimed at people comfortable with filter modes, IIR/FIR and per-band Q. If that is not you, it will feel like the wrong instrument rather than a hard one.
+```bash
+yay -S jamesdsp
+```
 
-**`jamesdsp`** (AUR) is a port of the Android app: a slider bank, a bass control, named presets. Closer to the equaliser on a phone, TV or car stereo.
+Then make it the default output and it processes everything:
 
-Whichever you pick, three things will otherwise waste your afternoon:
+```bash
+wpctl set-default $(pw-dump | jq -r '.[]|select(.info.props."node.description"?=="JamesDSP Sink")|.id')
+```
 
-1. **On Arch, `easyeffects` ships without its equaliser.** `lsp-plugins-lv2` is an *optional* dependency. Install `easyeffects` alone and the Equalizer appears in the pipeline as `ee_soe_equalizer` with **no controls and no audible effect** — which reads as a broken audio stack rather than a missing package. Install `lsp-plugins-lv2 calf mda.lv2 zam-plugins-lv2` alongside it; `pacman -Qi easyeffects | grep -A6 'Optional Deps'` lists the rest.
-2. **It quits when you close its window**, so any effect stops with it. Run it with `--hide-window` from autostart to keep it alive.
-3. **It only processes audio routed into `easyeffects_sink`.** If that is not your default output, the controls do nothing whatsoever. Check the chain with `pw-link -l | grep ee_soe_`.
+Add it to autostart with `Exec=jamesdsp --tray` so the effect persists across logins.
+
+**`easyeffects` is the more commonly recommended option, and it is the wrong recommendation for most people.** It is a capable tool aimed at users comfortable with filter modes, IIR/FIR and per-band Q. If that is not you it will feel unusable rather than merely unfamiliar. It also carries three pitfalls worth knowing before you spend an afternoon on it:
+
+1. **On Arch it ships without its equaliser.** `lsp-plugins-lv2` is an *optional* dependency, so installing `easyeffects` alone gives an Equalizer that appears in the pipeline as `ee_soe_equalizer` with **no controls and no audible effect** — indistinguishable from a broken audio stack. Install `lsp-plugins-lv2 calf mda.lv2 zam-plugins-lv2` alongside it.
+2. **It quits when you close its window**, taking the effect with it. Run it with `--hide-window` from autostart.
+3. **It only processes audio routed into `easyeffects_sink`.** If that is not the default output, its controls do nothing. Check with `pw-link -l | grep ee_soe_`.
+
+Whichever you choose, the equaliser is only tone shaping. The 4-channel fix above is the one that matters — without it the woofers receive no signal at all, and no amount of EQ will conjure bass out of a silent driver.
 
 ---
 
