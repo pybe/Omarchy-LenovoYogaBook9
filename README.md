@@ -16,6 +16,7 @@ Omarchy installs and runs fine on this machine, but the dual-screen hardware hit
 | Hyprland | 0.56.2 |
 | Kernel | 7.1.9-arch1-2 |
 | Panels | 2x Samsung 2880x1800@60, `eDP-1` (upper) and `eDP-2` (lower) |
+| Boot | limine + UKI, plymouth, LUKS2 root, SDDM with autologin |
 
 Panel identification matters throughout, and it is not guessable — **`eDP-1` is the upper screen and `eDP-2` is the lower one.** Confirm it on your own unit before applying anything, by changing one backlight and watching which screen reacts:
 
@@ -152,6 +153,61 @@ Binding to an output fixes both problems at once: input goes to the right screen
 
 ---
 
+## Quirk 4 — the boot splash and disk passphrase prompt are upside down
+
+### What you see
+
+The plymouth boot splash and the LUKS passphrase prompt render inverted on the upper panel, even after Quirk 1 has fixed the desktop. Everything is correct once Hyprland starts, and wrong before that.
+
+### Why
+
+Quirk 1 fixes the orientation *in the compositor*, which is the last thing to start. Everything earlier — the kernel console, plymouth, the passphrase prompt, and any display manager greeter — takes its cue from the DRM `panel orientation` property, and the kernel reports the panel as `Normal`:
+
+```
+$ modetest -c | grep -A3 'panel orientation'
+    511 panel orientation:
+        flags: immutable enum
+        enums: Normal=0 Upside Down=1 Left Side Up=2 Right Side Up=3
+        value: 0
+```
+
+`modetest` needs no privileges for this, and the property is immutable — it can only be changed at boot.
+
+### Fix
+
+Tell the kernel the panel's true orientation on the command line:
+
+```
+video=eDP-1:panel_orientation=upside_down
+```
+
+This kernel supports it — `drm_mode_parse_command_line_for_connector` and `drm_panel_orientation_enum_list` are both present in `/proc/kallsyms`. DRM is built in (`CONFIG_DRM=y`), so there is no module to check with `modinfo`.
+
+On Omarchy the bootloader is **limine** with a **UKI**, so the command line is assembled from `/etc/default/limine` plus drop-ins. Add it as a drop-in ([snippet](config/limine-entry-tool.d/panel-orientation.conf)) — editing `/boot/limine.conf` by hand is pointless, it gets regenerated:
+
+```bash
+sudo install -Dm644 config/limine-entry-tool.d/panel-orientation.conf \
+  /etc/limine-entry-tool.d/panel-orientation.conf
+sudo limine-mkinitcpio      # rebuilds the UKI and updates /boot/limine.conf
+```
+
+Verify it landed in the UKI itself, not just the config:
+
+```bash
+sudo objcopy -O binary --only-section=.cmdline \
+  /boot/EFI/Linux/omarchy_linux.efi /dev/stdout | tr -d '\0'
+```
+
+> **Expect to adjust Quirk 1 after this.** `libaquamarine.so` contains the string `panel orientation` (Hyprland itself does not), so Hyprland's backend appears to read the property too. If it does, it will compensate *and* so will the `transform = 2` from Quirk 1, cancelling out and leaving the desktop inverted. In that case drop the transform:
+>
+> ```bash
+> sed -i 's/scale = 2, transform = 2 })/scale = 2 })/' ~/.config/hypr/monitors.lua && hyprctl reload
+> ```
+>
+> Only eDP-1 is affected either way, so the lower screen stays usable while you sort it out. Your snapshot boot entry keeps the old command line as a fallback.
+
+---
+
 ## Applying all of it
 
 ```bash
@@ -168,6 +224,11 @@ done
 
 hyprctl reload
 hyprctl configerrors   # must print nothing
+
+# Quirk 4 — boot-time orientation. Needs a reboot to take effect.
+sudo install -Dm644 config/limine-entry-tool.d/panel-orientation.conf \
+  /etc/limine-entry-tool.d/panel-orientation.conf
+sudo limine-mkinitcpio
 ```
 
 Verify:
@@ -190,9 +251,9 @@ Then the one check that has no CLI equivalent: **touch each screen and drag a wi
 
 ## Status
 
-Verified on the system above: clean `hyprctl reload`, no config errors, layout survives reload, six brightness binds registered once each, both backlights tracking together, and touch/stylus confirmed by hand to land on the correct screen the right way up on both panels.
+Verified on the system above: clean `hyprctl reload`, no config errors, layout survives reload, six brightness binds registered once each, both backlights tracking together, touch and stylus confirmed by hand on both panels, and — **confirmed across a real reboot** — the second panel's brightness comes back correct.
 
-**Not yet verified:** persistence across a full reboot. The `autostart.lua` sync is there to handle `systemd-backlight` restoring the panels at different levels, but it hasn't been observed across an actual reboot cycle yet.
+**Quirk 4 is applied but not yet confirmed.** The parameter is verified present in `/boot/limine.conf` and in the UKI's `.cmdline` section, but whether the boot splash actually renders the right way up, and whether Hyprland then double-compensates, can only be settled by rebooting. Treat that section as untested until someone reports back.
 
 ## Tooling notes
 
@@ -209,6 +270,25 @@ hyprctl eval 'hl.monitor({ output = "eDP-1", mode = "2880x1800@60", position = "
 ## Open items
 
 Found during a survey of the machine but not fixed. Listed with the evidence so nobody has to re-derive it. Contributions welcome.
+
+### A Bluetooth keyboard cannot answer the disk passphrase prompt
+
+This machine ships with a **Bluetooth** keyboard and no built-in one, and on an encrypted install that is a genuine trap: the LUKS passphrase prompt runs in the initramfs, which has no Bluetooth stack at all. The `keyboard` hook covers USB HID only:
+
+```
+HOOKS=(base udev plymouth keyboard autodetect microcode modconf kms keymap
+       consolefont block encrypt filesystems fsck btrfs-overlayfs)
+```
+
+Note this comes from `/etc/mkinitcpio.conf.d/omarchy_hooks.conf`, not `/etc/mkinitcpio.conf` — the latter shows a stock hook list that is not what actually gets built.
+
+No configuration fixes this. You need a USB keyboard to boot, or you need to remove the prompt. Do not be fooled into thinking it is a display-manager problem: SDDM autologin is already configured by Omarchy and fires without ever drawing a greeter, so the only password box on an encrypted install is the LUKS one.
+
+```
+sddm-helper: pam_unix(sddm-autologin:session): session opened for user <you>
+```
+
+The prompt can be removed by enrolling the TPM, and the hardware supports it — TPM 2.0 at `/dev/tpm0`, LUKS2 with a single pbkdf2 keyslot and no TPM token. It requires switching the initramfs from the `encrypt` hook to `sd-encrypt`. **Weigh this carefully if Secure Boot is disabled**, as it is here: PCR-bound unlocking is materially weaker when unsigned code can boot and satisfy the same policy. Not done on this machine.
 
 ### Stylus palm rejection is paired to the wrong panel
 

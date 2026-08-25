@@ -118,6 +118,32 @@ topology               = intel/sof-tplg/sof-hda-generic-2ch.tplg
 Camera is a plain UVC device (`04f2:b7c5`) exposing `/dev/video0..3`, and needs
 no setup.
 
+## Boot stack
+
+Relevant because everything before the compositor renders at the kernel's
+panel orientation — see Quirk 4 in the README.
+
+```
+bootloader   limine, with a UKI (ENABLE_UKI=yes)
+cmdline from /etc/default/limine + /etc/limine-entry-tool.d/*.conf
+rebuild      limine-mkinitcpio   (regenerates UKI and /boot/limine.conf)
+splash       plymouth, theme "omarchy"
+encryption   LUKS2 on the root partition, "encrypt" hook, pbkdf2 keyslot
+login        SDDM, Wayland, autologin configured -> no greeter is drawn
+TPM          2.0 present at /dev/tpm0; no TPM token enrolled
+Secure Boot  disabled
+```
+
+Real initramfs hooks come from `/etc/mkinitcpio.conf.d/omarchy_hooks.conf`,
+**not** `/etc/mkinitcpio.conf`:
+
+```
+HOOKS=(base udev plymouth keyboard autodetect microcode modconf kms keymap
+       consolefont block encrypt filesystems fsck btrfs-overlayfs)
+```
+
+`keyboard` is USB HID only. There is no Bluetooth in the initramfs.
+
 ## Power
 
 ```
