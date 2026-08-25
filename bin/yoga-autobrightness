@@ -2,26 +2,35 @@
 
 # Ambient-light-driven brightness for the Yoga Book 9's two internal panels.
 #
-# Reads the ALS through iio-sensor-proxy's D-Bus interface and drives both
-# backlights. The second panel is set directly rather than through
-# omarchy-brightness-display, which resolves its target from the focused
-# monitor -- unhelpful for a background daemon.
+# Reads the ALS via monitor-sensor and drives both backlights.
 #
-# Backs off when brightness is changed by hand: if the panel is not where this
-# script last left it, someone else moved it, so auto-adjustment pauses.
+# Why monitor-sensor rather than polling the D-Bus property: iio-sensor-proxy
+# ties a light claim to the *connection* that made it. Each `busctl call
+# ClaimLight` opens a connection, claims, and exits -- dropping the claim
+# instantly. The sensor then powers down and LightLevel reads 0 forever, which
+# looks exactly like a broken sensor. monitor-sensor holds one connection open
+# for its lifetime, so the claim persists and readings keep flowing.
+#
+# The second panel is set directly rather than through
+# omarchy-brightness-display, which resolves its target from the focused
+# monitor -- meaningless for a background daemon.
+#
+# Backs off when brightness is changed by hand: if a panel is not where this
+# script last left it, someone else moved it, so adjustment pauses.
 
 set -u
 
 PRIMARY=intel_backlight
 SECONDARY=card1-eDP-2-backlight
 
-POLL_SECS=3
 MIN_PCT=10
 MAX_PCT=100
-STEP_THRESHOLD=3      # ignore changes smaller than this, to stop it hunting
-MANUAL_PAUSE_SECS=600 # how long to leave it alone after a manual change
+STEP_THRESHOLD=3      # ignore smaller changes, so it does not hunt
+APPLY_INTERVAL=2      # seconds; monitor-sensor emits far faster than this
+MANUAL_PAUSE_SECS=600
 
 last_set=-1
+last_apply=0
 paused_until=0
 
 current_pct() {
@@ -29,41 +38,45 @@ current_pct() {
 }
 
 lux_to_pct() {
-  # Logarithmic, because perceived brightness tracks log of illuminance.
-  #
-  # Fitted to the range a room actually spans rather than the sensor's full
-  # scale. This panel reads ~70 lux for normal indoor lighting and ~30 with
-  # the sensor covered; a curve stretched to daylight puts those eight
-  # percentage points apart and the whole feature goes unnoticed. Anchored
-  # instead at 30 lux -> 35% and 300 lux -> 80%, which makes ordinary changes
-  # in a room clearly visible while still reaching 100% outdoors.
+  # Logarithmic, because perceived brightness tracks log of illuminance, and
+  # fitted to the range a room actually spans rather than the sensor's full
+  # scale. This panel reads ~70 lux for normal indoor light and ~30 covered; a
+  # curve stretched to daylight puts those a handful of percent apart and the
+  # feature goes unnoticed. Anchored at 30 lux -> 20% and 300 lux -> 85%, which
+  # is deliberately steep: a gentler fit was measurably working yet too subtle
+  # to perceive, which is the worst outcome -- it looks broken and is not.
   awk -v l="$1" -v lo="$MIN_PCT" -v hi="$MAX_PCT" 'BEGIN {
-    p = -33 + 45.5 * log(l + 1) / log(10)
+    p = -78 + 65.8 * log(l + 1) / log(10)
     if (p < lo) p = lo
     if (p > hi) p = hi
     printf "%d", p
   }'
 }
 
-cleanup() {
-  busctl call net.hadess.SensorProxy /net/hadess/SensorProxy \
-    net.hadess.SensorProxy ReleaseLight >/dev/null 2>&1
-  exit 0
-}
-trap cleanup TERM INT EXIT
-
-# The sensor only reports while claimed.
-busctl call net.hadess.SensorProxy /net/hadess/SensorProxy \
-  net.hadess.SensorProxy ClaimLight >/dev/null 2>&1 || {
-  echo "could not claim the light sensor -- is iio-sensor-proxy running?" >&2
+command -v monitor-sensor >/dev/null || {
+  echo "monitor-sensor not found -- install iio-sensor-proxy" >&2
   exit 1
 }
 
+# monitor-sensor can exit (sensor hiccup, proxy restart). If it does, the
+# pipeline ends and this script would exit 0 -- which systemd reads as success
+# and, with Restart=on-failure, never restarts. Supervise it here instead.
 while :; do
+stdbuf -oL monitor-sensor 2>/dev/null | while IFS= read -r line; do
+  case "$line" in
+    *"Light changed"*|*"ambient light sensor"*) ;;
+    *) continue ;;
+  esac
+
+  lux=$(printf '%s' "$line" | grep -oE '[0-9]+\.[0-9]+' | head -1)
+  [[ -n ${lux:-} ]] || continue
+
   now=$(date +%s)
+  (( now - last_apply >= APPLY_INTERVAL )) || continue
+  last_apply=$now
+
   cur=$(current_pct)
 
-  # Someone moved it by hand -> stand down for a while.
   if [[ -n $cur && $last_set -ge 0 ]]; then
     diff=$(( cur > last_set ? cur - last_set : last_set - cur ))
     if (( diff > 2 )); then
@@ -72,23 +85,26 @@ while :; do
     fi
   fi
 
-  if (( now >= paused_until )); then
-    lux=$(busctl get-property net.hadess.SensorProxy /net/hadess/SensorProxy \
-          net.hadess.SensorProxy LightLevel 2>/dev/null | awk '{print $2}')
-    if [[ -n ${lux:-} ]]; then
-      target=$(lux_to_pct "$lux")
-      if [[ -n $cur ]]; then
-        delta=$(( target > cur ? target - cur : cur - target ))
-      else
-        delta=99
-      fi
-      if (( delta >= STEP_THRESHOLD )); then
-        brightnessctl -d "$PRIMARY"   set "${target}%" >/dev/null 2>&1
-        brightnessctl -d "$SECONDARY" set "${target}%" >/dev/null 2>&1
-        last_set=$target
-      fi
-    fi
+  (( now >= paused_until )) || continue
+
+  target=$(lux_to_pct "$lux")
+  if [[ -n $cur ]]; then
+    delta=$(( target > cur ? target - cur : cur - target ))
+  else
+    delta=99
   fi
 
-  sleep "$POLL_SECS"
+  if (( delta >= STEP_THRESHOLD )); then
+    brightnessctl -d "$PRIMARY"   set "${target}%" >/dev/null 2>&1
+    brightnessctl -d "$SECONDARY" set "${target}%" >/dev/null 2>&1
+    last_set=$target
+    # brightnessctl writes sysfs directly, which does not raise Omarchy's OSD --
+    # that is driven by omarchy-osd, called explicitly from the brightness keys.
+    # Show it here too so an automatic change is visible rather than mysterious.
+    command -v omarchy-osd >/dev/null && omarchy-osd -i brightness -p "$target" >/dev/null 2>&1 &
+  fi
+done
+
+  # monitor-sensor exited; pause briefly and bring it back.
+  sleep 3
 done

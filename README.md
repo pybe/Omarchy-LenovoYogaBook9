@@ -276,13 +276,20 @@ Three details that matter more than the sensor reading itself:
   | 1500+ | 100% |
 - **It stands down when you adjust brightness by hand.** If the panel is not where the daemon last left it, someone else moved it, so it pauses for ten minutes rather than fighting you. A threshold also stops it hunting over small fluctuations — the ALS drifts a few lux at rest.
 
-The sensor only reports while claimed, so the daemon calls `ClaimLight` on start and `ReleaseLight` on exit:
+### Three traps, all of which look like broken hardware
+
+**A light claim dies with the D-Bus connection that made it.** The obvious implementation — `busctl call ... ClaimLight`, then poll `LightLevel` — cannot work. Each `busctl` invocation opens a connection, claims, and exits, dropping the claim instantly. The sensor powers down and `LightLevel` returns `0` **forever**, while `HasAmbientLight` still reports `true`:
 
 ```bash
-busctl call net.hadess.SensorProxy /net/hadess/SensorProxy net.hadess.SensorProxy ClaimLight
-busctl get-property net.hadess.SensorProxy /net/hadess/SensorProxy net.hadess.SensorProxy LightLevel
-# d 73.025
+$ busctl get-property net.hadess.SensorProxy /net/hadess/SensorProxy net.hadess.SensorProxy LightLevel
+d 0
 ```
+
+That reads as a dead sensor. It is not — nothing is holding the claim. `monitor-sensor` keeps one connection open for its lifetime, so the daemon runs it as a long-lived process and reads its output instead.
+
+**A dying reader exits the script cleanly.** When `monitor-sensor` stops, the pipeline ends and the script exits `0`. systemd sees success, and `Restart=on-failure` correctly declines to restart it — leaving auto-brightness silently dead. The reader is supervised in a loop, and the unit uses `Restart=always`.
+
+**`brightnessctl` does not raise the OSD.** It writes sysfs directly; Omarchy's on-screen slider comes from `omarchy-osd`, which the brightness keybindings call explicitly. Without it an automatic change is invisible and looks like a glitch, so the daemon calls `omarchy-osd -i brightness -p <pct>` after adjusting.
 
 ---
 

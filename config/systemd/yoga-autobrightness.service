@@ -6,7 +6,7 @@ PartOf=graphical-session.target
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/yoga-autobrightness
-Restart=on-failure
+Restart=always
 RestartSec=5
 
 [Install]
