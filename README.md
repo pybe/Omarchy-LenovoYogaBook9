@@ -243,6 +243,18 @@ There is no escape hatch. aquamarine exposes `AQ_DRM_DEVICES`, `AQ_FORCE_LINEAR_
 
 Tried on this machine and backed out. An unusable pointer on the main panel is worse than a cosmetic boot logo, especially since the passphrase prompt needs a USB keyboard regardless.
 
+**The lower panel is not switched on yet when the prompt appears.** Observed boot sequence on this machine:
+
+| Stage | Screen | Orientation |
+|---|---|---|
+| limine boot menu (firmware GOP) | upper only | **correct** |
+| plymouth logo + passphrase prompt | upper only | upside down |
+| plymouth progress bar, first ~2/3 | upper only | upside down |
+| progress bar, last ~1/3 onward | both, mirrored | upper still upside down |
+| desktop (Hyprland) | both | correct |
+
+Two things follow. The firmware renders the upper panel correctly, so the inversion begins exactly when the kernel takes over the display — consistent with the missing DRM orientation quirk. And `eDP-2` only lights partway through plymouth's progress bar, well after the passphrase has been typed, so there is no lower panel to move the prompt onto at that moment. plymouth's DRM plugin logs `Found already lit monitor on connector %u` and `(Re)enumerating all outputs`, which fits: it attaches to whatever the firmware lit, then picks the second panel up later.
+
 **Relocating the prompt to the lower panel is not configurable either.** plymouth's whole config surface is `Theme`, `ThemeDir`, `ShowDelay`, `DeviceScale` and `DeviceTimeout` — there is no output or connector selection. However, its DRM renderer groups connectors into "heads" and clones those whose modes match:
 
 ```
