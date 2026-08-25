@@ -21,6 +21,8 @@ Panel identification matters throughout, and it is not guessable — **`eDP-1` i
 brightnessctl -d card1-eDP-2-backlight set 80%
 ```
 
+The `top` / `bottom` in the digitiser device names line up with this: `...-touchscreen-top` belongs to `eDP-1`, `...-touchscreen-bottom` to `eDP-2`. Verified by hand on this unit, but worth re-checking on yours.
+
 ---
 
 ## Quirk 1 — the top screen is upside down
@@ -113,6 +115,41 @@ brightnessctl -d intel_backlight set 40%         # upper panel only
 
 ---
 
+## Quirk 3 — touch and stylus land on the wrong screen
+
+### What you see
+
+Touching a screen does something on the *other* screen. After applying the Quirk 1 rotation, touch on the upper panel is additionally 180° out — drag a window and it moves the opposite way.
+
+### Why
+
+The firmware exposes a separate digitiser per panel, four devices in total:
+
+```
+$ hyprctl devices
+Tablets:  ...-stylus-top          ...-stylus-bottom
+Touch:    ...-touchscreen-top     ...-touchscreen-bottom
+```
+
+Hyprland does not bind these to outputs on its own, and it has no way to infer which panel each belongs to. An unbound touch device doesn't map to a single screen, and — importantly — **an unbound device does not inherit any output transform**. That is why the upper panel's touch input is inverted once `transform = 2` is applied: the pixels are rotated but the touch coordinates aren't.
+
+### Fix
+
+Bind each digitiser to its panel in `~/.config/hypr/input.lua` ([snippet](config/hypr/input.lua)):
+
+```lua
+hl.device({ name = "ingenic-gadget-serial-and-keyboard-touchscreen-top", output = "eDP-1" })
+hl.device({ name = "ingenic-gadget-serial-and-keyboard-stylus-top", output = "eDP-1" })
+hl.device({ name = "ingenic-gadget-serial-and-keyboard-touchscreen-bottom", output = "eDP-2" })
+hl.device({ name = "ingenic-gadget-serial-and-keyboard-stylus-bottom", output = "eDP-2" })
+```
+
+Binding to an output fixes both problems at once: input goes to the right screen, and the device picks up that output's transform.
+
+> **Verifying this is physical only.** There is no CLI check. `hyprctl devices -j` reports no output field for touch devices, and `hyprctl getoption device:<name>:<key>` returns `no such option` for *every* device key — including known-good ones on an ordinary mouse — so it can't confirm or deny a binding. A clean `hyprctl configerrors` tells you the config parsed, nothing more. Test by touching each screen.
+
+---
+
 ## Applying all of it
 
 ```bash
@@ -122,7 +159,7 @@ cd Omarchy-LenovoYogaBook9
 install -Dm755 bin/yoga-brightness ~/.local/bin/yoga-brightness
 
 # Back up first — these append to existing files.
-for f in monitors bindings autostart; do
+for f in monitors bindings autostart input; do
   cp ~/.config/hypr/$f.lua ~/.config/hypr/$f.lua.bak.$(date +%s)
   cat config/hypr/$f.lua >> ~/.config/hypr/$f.lua
 done
@@ -147,21 +184,83 @@ for d in intel_backlight card1-eDP-2-backlight; do
 done
 ```
 
+Then the one check that has no CLI equivalent: **touch each screen and drag a window with your finger.** Input should act on the screen you're touching, and follow your finger rather than moving opposite to it.
+
 ## Status
 
-Verified on the system above: clean `hyprctl reload`, no config errors, layout survives reload, six binds registered once each, both backlights tracking together.
+Verified on the system above: clean `hyprctl reload`, no config errors, layout survives reload, six brightness binds registered once each, both backlights tracking together, and touch/stylus confirmed by hand to land on the correct screen the right way up on both panels.
 
 **Not yet verified:** persistence across a full reboot. The `autostart.lua` sync is there to handle `systemd-backlight` restoring the panels at different levels, but it hasn't been observed across an actual reboot cycle yet.
 
 ## Open items
 
-Not investigated, listed so nobody assumes they're solved. Contributions welcome.
+Found during a survey of the machine but not fixed. Listed with the evidence so nobody has to re-derive it. Contributions welcome.
 
-- **Auto-rotation / hinge angle.** The hardware exposes the sensors — `als`, `accel_3d`, `gyro_3d` (x2) and a `hinge` sensor under `/sys/bus/iio/devices/` — but `iio-sensor-proxy` is `inactive`. Nothing currently reacts to folding the machine or changing its orientation, and the `hinge` sensor in particular looks like the intended signal for switching display modes.
-- **Touchscreen and stylus**, including whether touch input maps to the correct panel once `transform = 2` is applied.
-- **The virtual keyboard / trackpad overlay** on the lower panel, which on Windows is the main way the second screen gets used.
-- **Speakers and the rotating soundbar.**
-- **Sleep/resume** behaviour of the second panel's backlight.
+### Stylus palm rejection is paired to the wrong panel
+
+libinput's touch-arbitration heuristic can't distinguish the two identical digitiser pairs presented by the single USB gadget, and ends up pairing **both** styluses to the bottom touchscreen:
+
+```
+event7  - touch-arbitration: activated for ...Stylus Top<->...Touchscreen Top
+event7  - touch-arbitration: removing pairing for ...Stylus Top<->...Touchscreen Top
+event7  - touch-arbitration: activated for ...Stylus Top<->...Touchscreen Bottom
+event13 - touch-arbitration: activated for ...Stylus Bottom<->...Touchscreen Bottom
+```
+
+So resting a hand on the upper panel while drawing on it won't be arbitrated. This is below Hyprland — it needs a libinput quirks file, not compositor config.
+
+### Speaker amp calibration fails
+
+```
+tas2781-hda i2c-TIAS2781:00: tas2781_apply_calib: V1 CRC error
+```
+
+The TAS2781 smart amp rejects its calibration blob at every boot. Audio works, but an uncalibrated smart amp runs conservative, so expect thin and quiet output. The loaded topology is also the generic fallback rather than anything machine-specific:
+
+```
+loading topology: intel/sof-tplg/sof-hda-generic-2ch.tplg
+snd_hda_codec_alc269 ehdaudio0D0: autoconfig for ALC287: line_outs=2 type:speaker
+snd_hda_codec_alc269 ehdaudio0D0:    speaker_outs=0
+```
+
+### No sensor daemon, despite good sensor hardware
+
+`iio-sensor-proxy` is not installed, so nothing reacts to orientation, folding, or ambient light. The hardware is all present and live under `/sys/bus/iio/devices/`:
+
+| Sensor | Notes |
+|---|---|
+| `als` | Working — returns real readings from `in_illuminance_raw` |
+| `accel_3d` | Present |
+| `gyro_3d` (x2) | Present |
+| `hinge` | Exposes **three** angles: `in_angl0_raw` (hinge), `in_angl1_raw` (screen), `in_angl2_raw` (keyboard) |
+
+That three-angle hinge sensor is the obvious signal for auto-switching display modes on a machine like this. Read 0 across all three while stationary during the survey; whether that needs the daemon driving it or just movement wasn't established.
+
+### No firmware update path
+
+`fwupd` isn't installed. BIOS is `KXCN41WW`, dated 2024-12-19. Given how much of this machine's behaviour is firmware-driven, worth having.
+
+### No battery charge threshold
+
+ACPI can't resolve the embedded-controller charge object, and no `charge_control_*` attributes appear under `/sys/class/power_supply/BAT*/`:
+
+```
+ACPI Error: AE_NOT_FOUND, While resolving a named reference package element - \_SB_.PC00.LPCB.H_EC.CHRG
+ACPI Error: AE_NOT_FOUND, While resolving a named reference package element - \_SB_.PC00.LPCB.H_EC.SEN3
+```
+
+So charge limiting isn't available, and one thermal sensor (`SEN3`) is unreadable.
+
+### Not investigated
+
+- The virtual keyboard / trackpad overlay on the lower panel. Note the firmware presents its own `...-emulated-touchpad` device, so this is likely handled below the OS.
+- Sleep/resume behaviour of the second panel's backlight.
+
+## Confirmed working — don't go looking for problems here
+
+- **Camera** is a plain UVC device (`04f2:b7c5`), not IPU6, so it works with no setup.
+- **Power profiles** work via ACPI `platform_profile` (`low-power balanced performance`) with `power-profiles-daemon` active. The scary-looking `lenovo_wmi_gamezone ... platform_profile probe failed` in dmesg has no practical effect.
+- **Bluetooth**, **PipeWire**, and the **battery** (100% of design capacity) are all healthy. No failed systemd units, system or user.
 
 ## Upstream
 
