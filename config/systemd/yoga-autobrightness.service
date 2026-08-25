@@ -3,17 +3,19 @@ Description=Ambient-light brightness for both Yoga Book 9 panels
 After=graphical-session.target
 PartOf=graphical-session.target
 
+# StartLimit* must live in [Unit]: systemd moved them there in v229 and
+# silently ignores them in [Service] ("Unknown key ... ignoring"). Without
+# them, Restart=always with RestartSec=5 never trips the default limit, so a
+# permanently broken daemon loops forever as "activating (auto-restart)" and
+# never reaches "failed" where anyone would notice.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/yoga-autobrightness
 Restart=always
 RestartSec=5
-# Without a start limit, a daemon that dies instantly at startup (missing
-# python-gobject, absent sensor, renamed backlight) crash-loops forever showing
-# "activating (auto-restart)" and never reaches "failed", so the breakage is
-# never surfaced. At RestartSec=5 the systemd defaults never trip.
-StartLimitIntervalSec=60
-StartLimitBurst=5
 
 [Install]
 WantedBy=graphical-session.target

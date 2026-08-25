@@ -20,12 +20,38 @@ def prop(name):
         None, Gio.DBusCallFlags.NONE, -1, None)
     return v.unpack()[0]
 
+def iio_device(want):
+    """Resolve an IIO device by its name attribute.
+
+    Numbering is probe-order dependent -- this machine enumerates
+    gyro_3d, als, accel_3d, gyro_3d, hinge as devices 0-4, and a hardcoded
+    index silently reads the wrong sensor if that shuffles across a kernel or
+    firmware update. Reading gyro_3d instead of accel_3d is exactly the sort of
+    mistake that looks like working data.
+    """
+    import glob
+    for path in sorted(glob.glob("/sys/bus/iio/devices/iio:device*")):
+        try:
+            with open(f"{path}/name") as f:
+                if f.read().strip() == want:
+                    return path
+        except OSError:
+            continue
+    return None
+
+
+ACCEL = iio_device("accel_3d")
+HINGE = iio_device("hinge")
+
+
 def raw(axis):
+    if ACCEL is None:
+        return None
     try:
-        with open(f"/sys/bus/iio/devices/iio:device2/in_accel_{axis}_raw") as f:
+        with open(f"{ACCEL}/in_accel_{axis}_raw") as f:
             return int(f.read())
     except OSError:
-        return 0
+        return None
 
 LOG = "/tmp/yoga-orientation.log"
 log = open(LOG, "w", buffering=1)
@@ -34,12 +60,17 @@ print(f"Recording to {LOG}\n")
 print(f"{'orientation':<14}{'tilt':<12}{'accel x/y/z':<28}{'hinge':<8}")
 try:
     while True:
-        try:
-            with open("/sys/bus/iio/devices/iio:device4/in_angl0_raw") as f:
-                hinge = f.read().strip()
-        except OSError:
-            hinge = "n/a"
-        axes = f"{raw('x'):>7} {raw('y'):>8} {raw('z'):>8}"
+        if HINGE is None:
+            hinge = "absent"
+        else:
+            try:
+                with open(f"{HINGE}/in_angl0_raw") as f:
+                    hinge = f.read().strip()
+            except OSError:
+                hinge = "unreadable"
+        vals = [raw(a) for a in ("x", "y", "z")]
+        axes = ("accel_3d not found" if None in vals
+                else f"{vals[0]:>7} {vals[1]:>8} {vals[2]:>8}")
         line = (f"{prop('AccelerometerOrientation'):<14}"
                 f"{prop('AccelerometerTilt'):<12}{axes:<28}{hinge:<8}")
         print(line, flush=True)

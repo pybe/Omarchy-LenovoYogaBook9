@@ -17,7 +17,7 @@ merely being tilted, but it reads 0 permanently on this hardware. A stability
 delay stands in for it: an orientation must persist before it is acted on.
 """
 
-import os
+import json
 import signal
 import subprocess
 import sys
@@ -28,12 +28,6 @@ import gi
 
 gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib  # noqa: E402
-
-CONFIG_PATH = Path(
-    os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")
-) / "yoga-autorotate.conf"
-
-MODE_FILE = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "yoga-mode"
 
 POLL_SECONDS = 1
 STABLE_READINGS = 4   # ~4s of agreement before acting
@@ -46,33 +40,56 @@ ORIENTATION_TO_MODE = {
 }
 
 
-def enabled():
-    """Read fresh each poll so toggling applies without a restart."""
-    try:
-        for line in CONFIG_PATH.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            key, _, value = line.partition("=")
-            if key.strip() == "enabled":
-                return value.strip().lower() in ("1", "true", "yes", "on")
-    except OSError:
-        pass
-    return True
+# Expected layout per mode: (x, y, transform) for each panel. Present is
+# identified by eDP-1 mirroring rather than by position, since a mirroring
+# output's coordinates are not meaningful.
+LAYOUTS = {
+    "stand":     {"eDP-1": (0, 0, 2),   "eDP-2": (0, 900, 0)},
+    "book":      {"eDP-1": (900, 0, 3), "eDP-2": (0, 0, 1)},
+    "book-flip": {"eDP-1": (0, 0, 1),   "eDP-2": (900, 0, 3)},
+}
 
 
 def current_mode():
+    """Infer the mode from the live layout, not from a recorded value.
+
+    hyprctl eval changes are not persisted, so any Hyprland config reload --
+    an edit to ~/.config/hypr/*.lua, a theme change, or the `hyprctl reload`
+    the docs themselves suggest -- silently reverts both panels to the stand
+    layout in monitors.lua. A recorded mode would still claim "book", and the
+    daemon would decline to correct it because it believed it already had.
+    """
     try:
-        return MODE_FILE.read_text().strip()
-    except OSError:
-        return "stand"
+        out = subprocess.run(["hyprctl", "monitors", "all", "-j"],
+                             capture_output=True, text=True, timeout=10).stdout
+        monitors = {m["name"]: m for m in json.loads(out)}
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError):
+        return None
+
+    if monitors.get("eDP-1", {}).get("mirrorOf", "none") != "none":
+        return "present"
+
+    for name, expected in LAYOUTS.items():
+        if all(
+            (monitors.get(panel, {}).get("x"),
+             monitors.get(panel, {}).get("y"),
+             monitors.get(panel, {}).get("transform")) == want
+            for panel, want in expected.items()
+        ):
+            return name
+    return None
 
 
 def apply_mode(mode):
     try:
-        subprocess.run(["yoga-mode", mode], capture_output=True, timeout=15)
-    except (OSError, subprocess.SubprocessError):
-        pass
+        result = subprocess.run(["yoga-mode", mode],
+                                capture_output=True, text=True, timeout=15)
+        if result.returncode != 0:
+            print(f"yoga-mode {mode} failed: {result.stderr.strip()}",
+                  file=sys.stderr, flush=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"could not run yoga-mode {mode}: {exc}",
+              file=sys.stderr, flush=True)
 
 
 class Accelerometer:
@@ -130,9 +147,6 @@ def main():
     while True:
         time.sleep(POLL_SECONDS)
 
-        if not enabled():
-            continue
-
         try:
             orientation = accel.orientation()
         except GLib.Error:
@@ -152,8 +166,11 @@ def main():
         else:
             pending, count = target, 1
 
-        # Only act once the orientation has settled, and only if it is a change.
-        if count == STABLE_READINGS and target != current_mode():
+        # Act once the orientation has settled, and keep acting while it stays
+        # settled but the layout does not match. `==` here meant a single failed
+        # switch -- yoga-mode missing, hyprctl not up yet just after login --
+        # was never retried, because count then ran past the value forever.
+        if count >= STABLE_READINGS and target != current_mode():
             apply_mode(target)
 
 

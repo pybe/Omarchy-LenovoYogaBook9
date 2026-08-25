@@ -261,10 +261,18 @@ install -Dm755 bin/yoga-autobrightness ~/.local/bin/yoga-autobrightness
 install -Dm755 bin/yoga-autobrightness-osd ~/.local/bin/yoga-autobrightness-osd
 install -Dm755 bin/yoga-mode ~/.local/bin/yoga-mode
 install -Dm755 bin/yoga-orientation ~/.local/bin/yoga-orientation
+install -Dm755 bin/yoga-autorotate ~/.local/bin/yoga-autorotate
+install -Dm755 bin/yoga-autorotate-toggle ~/.local/bin/yoga-autorotate-toggle
+install -Dm644 config/systemd/yoga-autorotate.service \
+  ~/.config/systemd/user/yoga-autorotate.service
+install -Dm644 config/omarchy/omarchy-menu.jsonc \
+  ~/.config/omarchy/extensions/omarchy-menu.jsonc
 install -Dm644 config/yoga-autobrightness.conf ~/.config/yoga-autobrightness.conf
 install -Dm644 config/systemd/yoga-autobrightness.service \
   ~/.config/systemd/user/yoga-autobrightness.service
 systemctl --user daemon-reload && systemctl --user enable --now yoga-autobrightness
+systemctl --user enable --now yoga-autorotate
+omarchy menu refresh
 ```
 
 Three details that matter more than the sensor reading itself:
@@ -377,7 +385,6 @@ bottom-up -> present     folded in half, upper panel facing away
 
 ```bash
 install -Dm755 bin/yoga-autorotate ~/.local/bin/yoga-autorotate
-install -Dm644 config/yoga-autorotate.conf ~/.config/yoga-autorotate.conf
 install -Dm644 config/systemd/yoga-autorotate.service \
   ~/.config/systemd/user/yoga-autorotate.service
 systemctl --user daemon-reload && systemctl --user enable --now yoga-autorotate
@@ -385,7 +392,11 @@ systemctl --user daemon-reload && systemctl --user enable --now yoga-autorotate
 
 All four positions switch automatically. An earlier version excluded present on the mistaken belief it was undetectable, which also required a guard suspending auto-switching while present was active — that would have trapped the machine in present mode once present became detectable. Both are gone.
 
-The missing hinge is covered by requiring an orientation to hold for about four seconds before acting — without it, a genuine fold and an incidental tilt look identical. Disable with `enabled = false` in `~/.config/yoga-autorotate.conf`, which is re-read every poll.
+The missing hinge is covered by requiring an orientation to hold for about four seconds before acting — without it, a genuine fold and an incidental tilt look identical.
+
+Turn it on and off with `yoga-autorotate-toggle` (or the Omarchy menu entry), which starts and stops the service. There is deliberately **one** switch: an earlier version also had an `enabled` flag in a config file, so the menu could show auto-rotate ticked while the daemon sat inert, with nothing to explain why.
+
+It reads the layout back from `hyprctl monitors` rather than trusting a recorded value. `hyprctl eval` changes are not persisted, so any Hyprland config reload silently reverts both panels to the stand layout in `monitors.lua`; a daemon trusting its own record would believe it had already applied book mode and never correct it.
 
 ---
 
@@ -424,11 +435,19 @@ install -Dm755 bin/yoga-autobrightness ~/.local/bin/yoga-autobrightness
 install -Dm755 bin/yoga-autobrightness-osd ~/.local/bin/yoga-autobrightness-osd
 install -Dm755 bin/yoga-mode ~/.local/bin/yoga-mode
 install -Dm755 bin/yoga-orientation ~/.local/bin/yoga-orientation
+install -Dm755 bin/yoga-autorotate ~/.local/bin/yoga-autorotate
+install -Dm755 bin/yoga-autorotate-toggle ~/.local/bin/yoga-autorotate-toggle
+install -Dm644 config/systemd/yoga-autorotate.service \
+  ~/.config/systemd/user/yoga-autorotate.service
+install -Dm644 config/omarchy/omarchy-menu.jsonc \
+  ~/.config/omarchy/extensions/omarchy-menu.jsonc
 install -Dm644 config/yoga-autobrightness.conf ~/.config/yoga-autobrightness.conf
 install -Dm644 config/systemd/yoga-autobrightness.service \
   ~/.config/systemd/user/yoga-autobrightness.service
 systemctl --user daemon-reload
 systemctl --user enable --now yoga-autobrightness
+systemctl --user enable --now yoga-autorotate
+omarchy menu refresh
 ```
 
 Verify:

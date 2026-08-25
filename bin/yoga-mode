@@ -3,74 +3,80 @@
 # Switch the Yoga Book 9's two panels between physical usage modes.
 #
 # eDP-1 is the upper panel and is mounted 180 degrees out, so every transform
-# for it is the one eDP-2 needs plus 2 (mod 4). That relationship holds in
-# every mode and is why the numbers below look asymmetric.
+# for it is the one eDP-2 needs plus 2 (mod 4). That holds in every mode and is
+# why the numbers below look asymmetric.
 #
 # hyprctl keyword does not work under Omarchy's Lua config parser -- these go
 # through hyprctl eval instead.
 #
-# Every non-mirroring mode sets mirror = "none" explicitly. Without it the
-# mirror set by present mode persists into the others, and since
-# `hyprctl monitors` HIDES mirrored outputs the panel appears to have vanished
-# rather than merely being mirrored -- use `hyprctl monitors all` to see it.
+# Every mode follows the same order: park eDP-2 far away, place eDP-1, then
+# place eDP-2. Moving one panel and then the other otherwise leaves a moment
+# where both occupy the same space, and Hyprland raises its on-screen
+# "Monitor ... overlaps" banner. A previous version parked eDP-2 but then
+# placed it FIRST in book and present modes, which reintroduced the very
+# overlap the parking existed to avoid.
+#
+# Every non-mirroring mode sets mirror = "none" explicitly. Set once it
+# persists, and because `hyprctl monitors` HIDES mirrored outputs the panel
+# then appears to have vanished rather than merely being mirrored -- use
+# `hyprctl monitors all` when a monitor seems to disappear.
 
 set -u
 
 MODE_FILE="${XDG_RUNTIME_DIR:-/tmp}/yoga-mode"
+SHELL_JSON="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/shell.json"
 MODE="2880x1800@60"
+PARK="10000x0"
 
-apply() { hyprctl eval "$1" >/dev/null 2>&1; }
-
-# Moving one panel and then the other leaves a moment where both occupy the
-# same space, and Hyprland raises its on-screen config error banner for it --
-# briefly, but visibly, on every switch. Park the lower panel far away first so
-# the two never overlap at any point in the sequence.
-park() {
-  apply "hl.monitor({ output = \"eDP-2\", mode = \"$MODE\", position = \"10000x0\", scale = 2, transform = 0, mirror = \"none\" })"
+# Propagate failure: a mode that did not apply must not be recorded as current,
+# or the menu ticks the wrong row, `cycle` steps from a false state, and
+# yoga-autorotate believes the layout already matches.
+apply() {
+  local out
+  if ! out="$(hyprctl eval "$1" 2>&1)" || [[ $out != ok* ]]; then
+    echo "hyprctl eval failed: ${out:-no output}" >&2
+    return 1
+  fi
 }
 
-# Stand / laptop: stacked landscape, upper above lower. The everyday layout.
+park() {
+  apply "hl.monitor({ output = \"eDP-2\", mode = \"$MODE\", position = \"$PARK\", scale = 2, transform = 0, mirror = \"none\" })"
+}
+
 mode_stand() {
-  park
-  apply "hl.monitor({ output = \"eDP-1\", mode = \"$MODE\", position = \"0x0\",   scale = 2, transform = 2, mirror = \"none\" })"
+  park &&
+  apply "hl.monitor({ output = \"eDP-1\", mode = \"$MODE\", position = \"0x0\",   scale = 2, transform = 2, mirror = \"none\" })" &&
   apply "hl.monitor({ output = \"eDP-2\", mode = \"$MODE\", position = \"0x900\", scale = 2, transform = 0, mirror = \"none\" })"
 }
 
 # Book: machine turned 90 degrees, two portrait screens side by side.
 # 900x1440 logical each once rotated, so the right-hand panel starts at x=900.
 mode_book() {
-  park
+  park &&
+  apply "hl.monitor({ output = \"eDP-1\", mode = \"$MODE\", position = \"900x0\", scale = 2, transform = 3, mirror = \"none\" })" &&
   apply "hl.monitor({ output = \"eDP-2\", mode = \"$MODE\", position = \"0x0\",   scale = 2, transform = 1, mirror = \"none\" })"
-  apply "hl.monitor({ output = \"eDP-1\", mode = \"$MODE\", position = \"900x0\", scale = 2, transform = 3, mirror = \"none\" })"
 }
 
-# Book, turned the other way. Which direction you rotate depends on where the
-# ports and cables are, so both are provided. Every panel gains 180 degrees
-# relative to mode_book, and the two swap sides.
+# Book turned the other way. Which direction you rotate depends on where the
+# ports and cables are, so both exist. Each panel gains 180 degrees relative to
+# mode_book, and the two swap sides.
 mode_book_flip() {
-  park
-  apply "hl.monitor({ output = \"eDP-1\", mode = \"$MODE\", position = \"0x0\",   scale = 2, transform = 1, mirror = \"none\" })"
+  park &&
+  apply "hl.monitor({ output = \"eDP-1\", mode = \"$MODE\", position = \"0x0\",   scale = 2, transform = 1, mirror = \"none\" })" &&
   apply "hl.monitor({ output = \"eDP-2\", mode = \"$MODE\", position = \"900x0\", scale = 2, transform = 3, mirror = \"none\" })"
 }
 
-# Present: mirrored, upper panel facing the person opposite. The upper panel
-# drops to transform 0 -- upside down to you, correct way up to them.
+# Present: machine folded in half, upper panel facing the person opposite. It
+# mirrors the lower panel at transform 0 -- upside down to you, correct way up
+# to them. A mirroring output ignores its position visually but Hyprland still
+# counts it in the layout, so it must not share coordinates with eDP-2.
 mode_present() {
-  park
-  apply "hl.monitor({ output = \"eDP-2\", mode = \"$MODE\", position = \"0x0\", scale = 2, transform = 0 })"
-  # A mirroring output ignores its position visually, but Hyprland still counts
-  # it in the layout -- placing it at 0x0 alongside eDP-2 raises "Monitor eDP-1
-  # overlaps with other monitor(s)". Park it clear of eDP-2 instead.
-  apply "hl.monitor({ output = \"eDP-1\", mode = \"$MODE\", position = \"0x900\", scale = 2, transform = 0, mirror = \"eDP-2\" })"
+  park &&
+  apply "hl.monitor({ output = \"eDP-1\", mode = \"$MODE\", position = \"0x900\", scale = 2, transform = 0, mirror = \"eDP-2\" })" &&
+  apply "hl.monitor({ output = \"eDP-2\", mode = \"$MODE\", position = \"0x0\",   scale = 2, transform = 0, mirror = \"none\" })"
 }
 
 current() { cat "$MODE_FILE" 2>/dev/null || echo stand; }
-
-# Changing the layout can make the shell rewrite its own config and relocate
-# the bar -- observed moving from top to left during a mode switch. Capture the
-# configured position before switching and put it back afterwards, so the
-# user's choice survives.
-SHELL_JSON="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/shell.json"
 
 bar_position() {
   python3 -c "import json,sys
@@ -78,16 +84,22 @@ try: print(json.load(open(sys.argv[1]))['bar']['position'])
 except Exception: pass" "$SHELL_JSON" 2>/dev/null
 }
 
+# Changing the layout can make the shell rewrite its own config and relocate
+# the bar. Put the user's choice back afterwards. Written atomically: this
+# truncates a live config the user depends on, and a mode switch during logout
+# is exactly when it could be interrupted.
 restore_bar_position() {
   local want="$1" have
-  [ -n "$want" ] || return 0
+  [[ -n $want ]] || return 0
   sleep 1
   have="$(bar_position)"
-  [ "$have" = "$want" ] && return 0
-  python3 -c "import json,sys
+  [[ $have == "$want" ]] && return 0
+  python3 -c "import json,os,sys,tempfile
 p,want=sys.argv[1],sys.argv[2]
 d=json.load(open(p)); d['bar']['position']=want
-open(p,'w').write(json.dumps(d,indent=2)+'\n')" "$SHELL_JSON" "$want" 2>/dev/null &&
+fd,tmp=tempfile.mkstemp(dir=os.path.dirname(p))
+with os.fdopen(fd,'w') as f: f.write(json.dumps(d,indent=2)+'\n')
+os.replace(tmp,p)" "$SHELL_JSON" "$want" &&
     echo "restored bar position: $have -> $want"
 }
 
@@ -97,19 +109,30 @@ notify() {
   echo "display mode: $1"
 }
 
-WANTED_BAR="$(bar_position)"
+# Apply a mode, and only record and announce it if it actually took.
+switch_to() {
+  local name="$1" fn="$2" label="${3:-$1}" wanted_bar
+  wanted_bar="$(bar_position)"
+  if ! "$fn"; then
+    echo "failed to switch to $name; layout unchanged" >&2
+    return 1
+  fi
+  echo "$name" > "$MODE_FILE"
+  restore_bar_position "$wanted_bar"
+  notify "$label"
+}
 
 case "${1:-cycle}" in
-stand | laptop) mode_stand;   echo stand   > "$MODE_FILE"; restore_bar_position "$WANTED_BAR"; notify stand ;;
-book)               mode_book;      echo book      > "$MODE_FILE"; restore_bar_position "$WANTED_BAR"; notify "book" ;;
-book-flip | book2)  mode_book_flip; echo book-flip > "$MODE_FILE"; restore_bar_position "$WANTED_BAR"; notify "book (other way)" ;;
-present | tent) mode_present; echo present > "$MODE_FILE"; restore_bar_position "$WANTED_BAR"; notify present ;;
+stand | laptop)    switch_to stand     mode_stand ;;
+book)              switch_to book      mode_book ;;
+book-flip | book2) switch_to book-flip mode_book_flip "book (other way)" ;;
+present | tent)    switch_to present   mode_present ;;
 cycle)
   case "$(current)" in
-  stand)     "$0" book ;;
-  book)      "$0" book-flip ;;
-  book-flip) "$0" present ;;
-  *)         "$0" stand ;;
+  stand)     exec "$0" book ;;
+  book)      exec "$0" book-flip ;;
+  book-flip) exec "$0" present ;;
+  *)         exec "$0" stand ;;
   esac
   ;;
 status) current ;;

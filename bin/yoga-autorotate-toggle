@@ -13,7 +13,10 @@ state() { systemctl --user is-active --quiet "$UNIT" && echo on || echo off; }
 case "${1:-toggle}" in
 on)     systemctl --user enable --now "$UNIT" >/dev/null 2>&1 ;;
 off)    systemctl --user disable --now "$UNIT" >/dev/null 2>&1 ;;
-toggle) [ "$(state)" = on ] && "$0" off || "$0" on ;;
+# exec, not a plain call: otherwise the child runs the notify tail below and
+# control returns to the parent, which runs it again -- two identical
+# notifications a second apart from one menu click.
+toggle) [ "$(state)" = on ] && exec "$0" off || exec "$0" on ;;
 status) state; exit 0 ;;
 *)      echo "usage: ${0##*/} [on|off|toggle|status]" >&2; exit 1 ;;
 esac
