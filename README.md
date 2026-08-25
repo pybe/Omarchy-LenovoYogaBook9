@@ -59,6 +59,8 @@ hl.monitor({ output = "eDP-2", mode = "2880x1800@60", position = "0x900", scale 
 
 Omarchy's stock `hl.monitor({ output = "", ... })` catch-all line stays where it is — these come after it and take precedence.
 
+> **Do not also set `video=eDP-1:panel_orientation=upside_down` on the kernel command line.** It is the obvious way to fix the upside-down boot splash, and it breaks the pointer. See [the boot splash open item](#the-boot-splash-and-passphrase-prompt-are-upside-down--unresolved) before trying it.
+
 > **Note:** `hyprctl keyword monitor ...` does **not** work on Omarchy. Omarchy configures Hyprland in Lua, and you get `keyword can't work with non-legacy parsers. Use eval.` To test a monitor change live before committing it to config:
 > ```bash
 > hyprctl eval 'hl.monitor({ output = "eDP-1", mode = "2880x1800@60", position = "0x0", scale = 2, transform = 2 })'
@@ -153,61 +155,6 @@ Binding to an output fixes both problems at once: input goes to the right screen
 
 ---
 
-## Quirk 4 — the boot splash and disk passphrase prompt are upside down
-
-### What you see
-
-The plymouth boot splash and the LUKS passphrase prompt render inverted on the upper panel, even after Quirk 1 has fixed the desktop. Everything is correct once Hyprland starts, and wrong before that.
-
-### Why
-
-Quirk 1 fixes the orientation *in the compositor*, which is the last thing to start. Everything earlier — the kernel console, plymouth, the passphrase prompt, and any display manager greeter — takes its cue from the DRM `panel orientation` property, and the kernel reports the panel as `Normal`:
-
-```
-$ modetest -c | grep -A3 'panel orientation'
-    511 panel orientation:
-        flags: immutable enum
-        enums: Normal=0 Upside Down=1 Left Side Up=2 Right Side Up=3
-        value: 0
-```
-
-`modetest` needs no privileges for this, and the property is immutable — it can only be changed at boot.
-
-### Fix
-
-Tell the kernel the panel's true orientation on the command line:
-
-```
-video=eDP-1:panel_orientation=upside_down
-```
-
-This kernel supports it — `drm_mode_parse_command_line_for_connector` and `drm_panel_orientation_enum_list` are both present in `/proc/kallsyms`. DRM is built in (`CONFIG_DRM=y`), so there is no module to check with `modinfo`.
-
-On Omarchy the bootloader is **limine** with a **UKI**, so the command line is assembled from `/etc/default/limine` plus drop-ins. Add it as a drop-in ([snippet](config/limine-entry-tool.d/panel-orientation.conf)) — editing `/boot/limine.conf` by hand is pointless, it gets regenerated:
-
-```bash
-sudo install -Dm644 config/limine-entry-tool.d/panel-orientation.conf \
-  /etc/limine-entry-tool.d/panel-orientation.conf
-sudo limine-mkinitcpio      # rebuilds the UKI and updates /boot/limine.conf
-```
-
-Verify it landed in the UKI itself, not just the config:
-
-```bash
-sudo objcopy -O binary --only-section=.cmdline \
-  /boot/EFI/Linux/omarchy_linux.efi /dev/stdout | tr -d '\0'
-```
-
-> **Expect to adjust Quirk 1 after this.** `libaquamarine.so` contains the string `panel orientation` (Hyprland itself does not), so Hyprland's backend appears to read the property too. If it does, it will compensate *and* so will the `transform = 2` from Quirk 1, cancelling out and leaving the desktop inverted. In that case drop the transform:
->
-> ```bash
-> sed -i 's/scale = 2, transform = 2 })/scale = 2 })/' ~/.config/hypr/monitors.lua && hyprctl reload
-> ```
->
-> Only eDP-1 is affected either way, so the lower screen stays usable while you sort it out. Your snapshot boot entry keeps the old command line as a fallback.
-
----
-
 ## Applying all of it
 
 ```bash
@@ -224,11 +171,6 @@ done
 
 hyprctl reload
 hyprctl configerrors   # must print nothing
-
-# Quirk 4 — boot-time orientation. Needs a reboot to take effect.
-sudo install -Dm644 config/limine-entry-tool.d/panel-orientation.conf \
-  /etc/limine-entry-tool.d/panel-orientation.conf
-sudo limine-mkinitcpio
 ```
 
 Verify:
@@ -251,9 +193,9 @@ Then the one check that has no CLI equivalent: **touch each screen and drag a wi
 
 ## Status
 
-Verified on the system above: clean `hyprctl reload`, no config errors, layout survives reload, six brightness binds registered once each, both backlights tracking together, touch and stylus confirmed by hand on both panels, and — **confirmed across a real reboot** — the second panel's brightness comes back correct.
+Everything in Quirks 1-3 is verified on the system above, including across a full reboot: clean `hyprctl reload`, no config errors, layout and per-panel brightness both correct after restart, six brightness binds registered once each, and touch/stylus confirmed by hand on both panels.
 
-**Quirk 4 is applied but not yet confirmed.** The parameter is verified present in `/boot/limine.conf` and in the UKI's `.cmdline` section, but whether the boot splash actually renders the right way up, and whether Hyprland then double-compensates, can only be settled by rebooting. Treat that section as untested until someone reports back.
+The boot splash and passphrase prompt remain upside down. That is unresolved, not unattempted — see Open items for what was tried and why it was backed out.
 
 ## Tooling notes
 
@@ -270,6 +212,45 @@ hyprctl eval 'hl.monitor({ output = "eDP-1", mode = "2880x1800@60", position = "
 ## Open items
 
 Found during a survey of the machine but not fixed. Listed with the evidence so nobody has to re-derive it. Contributions welcome.
+
+### The boot splash and passphrase prompt are upside down — unresolved
+
+Quirk 1 fixes orientation inside the compositor, which starts last. The kernel console, the plymouth splash and the LUKS passphrase prompt all take their cue from the DRM `panel orientation` property, which the kernel reports as `Normal` for this model:
+
+```bash
+modetest -c | grep -A3 'panel orientation'   # no privileges needed
+#     enums: Normal=0 Upside Down=1 Left Side Up=2 Right Side Up=3
+#     value: 0
+```
+
+**The obvious fix works for display and breaks the pointer.** Setting the true orientation on the kernel command line —
+
+```
+video=eDP-1:panel_orientation=upside_down
+```
+
+— does fix the boot splash and the passphrase prompt. But Hyprland's backend reads the same property (`libaquamarine.so` contains the string `panel orientation`; the `Hyprland` binary does not) and rotates the scanout, **without** applying that rotation to input mapping. The image comes out right and the pointer travels the wrong way on that panel.
+
+The two settings are coupled, and there is no combination that satisfies both:
+
+| Configuration | Boot splash | Desktop image | Pointer |
+|---|---|---|---|
+| Kernel param, no Hyprland transform | correct | correct | **inverted on eDP-1** |
+| Kernel param **and** `transform = 2` | correct | **upside down** | correct-relative-to-image |
+| No param, `transform = 2` *(what this repo ships)* | **upside down** | correct | correct |
+
+There is no escape hatch. aquamarine exposes `AQ_DRM_DEVICES`, `AQ_FORCE_LINEAR_BLIT`, `AQ_LIBINPUT_NO_PLUGINS`, `AQ_MGPU_NO_EXPLICIT`, `AQ_NO_ATOMIC`, `AQ_NO_MODIFIERS` and `AQ_TRACEUH` — none disable orientation handling — and Hyprland has no config option for it either.
+
+Tried on this machine and backed out. An unusable pointer on the main panel is worse than a cosmetic boot logo, especially since the passphrase prompt needs a USB keyboard regardless.
+
+For reference, if you want to experiment: Omarchy boots limine with a UKI, so the command line is assembled from `/etc/default/limine` plus `/etc/limine-entry-tool.d/*.conf`. Add a drop-in there and run `limine-mkinitcpio`; editing `/boot/limine.conf` directly is pointless because it is regenerated. Confirm what actually reached the UKI with:
+
+```bash
+sudo objcopy -O binary --only-section=.cmdline \
+  /boot/EFI/Linux/omarchy_linux.efi /dev/stdout | tr -d '\0'
+```
+
+Note the property is only read at boot, so every iteration costs a reboot.
 
 ### A Bluetooth keyboard cannot answer the disk passphrase prompt
 
@@ -366,5 +347,7 @@ So charge limiting isn't available, and one thermal sensor (`SEN3`) is unreadabl
 - **Bluetooth**, **PipeWire**, and the **battery** (100% of design capacity) are all healthy. No failed systemd units, system or user.
 
 ## Upstream
+
+The input-mapping mismatch above looks like an aquamarine bug rather than a device quirk: applying a panel orientation to scanout while leaving the output's logical transform untouched makes display and input disagree by exactly that rotation. Any machine with a `panel_orientation` quirk or kernel parameter would hit it. Not filed upstream yet.
 
 Quirk 2 is arguably an Omarchy bug rather than a device quirk — `omarchy-hw-display` returning a single device is a reasonable assumption that this hardware breaks. A general fix would make it return all internal backlights, or have `omarchy-brightness-display` resolve the backlight from the focused monitor rather than a global preference list. Not filed upstream yet.

@@ -121,7 +121,9 @@ no setup.
 ## Boot stack
 
 Relevant because everything before the compositor renders at the kernel's
-panel orientation — see Quirk 4 in the README.
+panel orientation, which is why the boot splash is upside down. See the
+"boot splash" entry under Open items in the README — the obvious kernel-side
+fix breaks pointer input and was backed out.
 
 ```
 bootloader   limine, with a UKI (ENABLE_UKI=yes)
