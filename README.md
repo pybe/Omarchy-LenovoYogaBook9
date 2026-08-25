@@ -665,11 +665,14 @@ Still genuinely missing: the `SEN3` thermal sensor is unreadable.
 
 ### Not investigated
 
-- **The virtual keyboard and trackpad do not work on Linux, and cannot without new software.** On Windows they are provided by Lenovo's *Yoga Book 9 User Center*, which watches the lower touchscreen for gestures — an 8-finger tap raises the virtual touchpad, a 3-finger tap the virtual keyboard — then switches that screen into input mode and draws the graphics. That application is Windows-only.
+- **The virtual keyboard and trackpad — UNTESTED.** On Windows they come from Lenovo's *Yoga Book 9 User Center*, which watches the lower touchscreen for gestures (8-finger tap for the touchpad, 3-finger for the keyboard), switches that panel into input mode and draws the graphics. That application is Windows-only and no Linux equivalent is known.
 
-  The firmware does present the input devices regardless (`...-emulated-touchpad` and `...-keyboard` on the INGENIC USB gadget), which makes it look as though the feature is available. Nothing on Linux listens for the gestures, switches the mode, or renders anything, so those devices stay dormant. The `BTN_RIGHT` quirk above is therefore currently theoretical: it fixes a device that never activates.
+  **The gestures have never been tried on this machine**, so whether anything responds is genuinely unknown. An earlier version of this file stated flatly that the feature "does not work on Linux and cannot without new software" — that was reasoned from a web search, not tested, and should not have been written as a finding.
 
-  Anyone wanting a touch keyboard on the lower panel today would use a general Wayland on-screen keyboard (`wvkbd`, `squeekboard`) positioned there — not Lenovo's.
+  The firmware presents the input devices (`...-emulated-touchpad` and `...-keyboard` on the INGENIC USB gadget) independently of any host software, which leaves open the possibility that part of this is firmware-side.
+
+  **The test:** tap the lower screen with eight fingers, then with three, and see whether anything appears. Until someone does that, everything above is assumption. The `BTN_RIGHT` quirk's usefulness depends on the same unknown.
+
 - Sleep/resume behaviour of the second panel's backlight.
 
 ## Confirmed working — don't go looking for problems here
