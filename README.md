@@ -265,7 +265,15 @@ systemctl --user daemon-reload && systemctl --user enable --now yoga-autobrightn
 Three details that matter more than the sensor reading itself:
 
 - **It sets both backlights directly** rather than calling `omarchy-brightness-display`, which resolves its target from the *focused monitor* — meaningless for a background daemon.
-- **The curve is logarithmic.** Perceived brightness tracks the log of illuminance, so a linear map wastes most of its range on daylight levels nobody sits in. Roughly: 0 lux → 10%, 50 → 47%, 1000 → 76%, 10000 → 98%.
+- **The curve is logarithmic, and fitted to the range a room actually spans.** This is the part worth getting right. The panel reads roughly **70 lux for normal indoor lighting and 30 with the sensor covered** — a much narrower band than the sensor's full scale. A curve stretched to daylight puts those two states only eight percentage points apart, and the whole feature goes unnoticed; the first attempt here did exactly that. Anchoring instead at 30 lux → 34% and 300 lux → 79% makes ordinary changes in a room obvious while still reaching 100% outdoors:
+
+  | lux | brightness |
+  |---|---|
+  | 0 | 10% |
+  | 30 (sensor covered) | 34% |
+  | 70 (normal indoor) | 51% |
+  | 300 | 79% |
+  | 1500+ | 100% |
 - **It stands down when you adjust brightness by hand.** If the panel is not where the daemon last left it, someone else moved it, so it pauses for ten minutes rather than fighting you. A threshold also stops it hunting over small fluctuations — the ALS drifts a few lux at rest.
 
 The sensor only reports while claimed, so the daemon calls `ClaimLight` on start and `ReleaseLight` on exit:

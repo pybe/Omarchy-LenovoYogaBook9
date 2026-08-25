@@ -15,10 +15,10 @@ set -u
 PRIMARY=intel_backlight
 SECONDARY=card1-eDP-2-backlight
 
-POLL_SECS=5
+POLL_SECS=3
 MIN_PCT=10
 MAX_PCT=100
-STEP_THRESHOLD=5      # ignore changes smaller than this, to stop it hunting
+STEP_THRESHOLD=3      # ignore changes smaller than this, to stop it hunting
 MANUAL_PAUSE_SECS=600 # how long to leave it alone after a manual change
 
 last_set=-1
@@ -29,10 +29,16 @@ current_pct() {
 }
 
 lux_to_pct() {
-  # Logarithmic: perceived brightness tracks log of illuminance, so a linear
-  # map would spend most of its range on daylight levels nobody sits in.
+  # Logarithmic, because perceived brightness tracks log of illuminance.
+  #
+  # Fitted to the range a room actually spans rather than the sensor's full
+  # scale. This panel reads ~70 lux for normal indoor lighting and ~30 with
+  # the sensor covered; a curve stretched to daylight puts those eight
+  # percentage points apart and the whole feature goes unnoticed. Anchored
+  # instead at 30 lux -> 35% and 300 lux -> 80%, which makes ordinary changes
+  # in a room clearly visible while still reaching 100% outdoors.
   awk -v l="$1" -v lo="$MIN_PCT" -v hi="$MAX_PCT" 'BEGIN {
-    p = 10 + 22 * log(l + 1) / log(10)
+    p = -33 + 45.5 * log(l + 1) / log(10)
     if (p < lo) p = lo
     if (p > hi) p = hi
     printf "%d", p
