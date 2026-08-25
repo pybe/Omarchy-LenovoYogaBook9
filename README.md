@@ -4,6 +4,8 @@ Notes and config for running [Omarchy](https://omarchy.org/) on a **Lenovo Yoga 
 
 Omarchy installs and runs fine on this machine, but the dual-screen hardware hits a few things that no amount of clicking around will fix, because they need config that doesn't exist by default. This documents each one: what you see, what's actually causing it, and the fix.
 
+[`HARDWARE.md`](HARDWARE.md) has the full device inventory from a working install — displays, backlights, input devices, sensors, audio, power — with the command behind each table, so you can diff your unit against a known-good one.
+
 ## System this was worked out on
 
 | | |
@@ -146,7 +148,7 @@ hl.device({ name = "ingenic-gadget-serial-and-keyboard-stylus-bottom", output = 
 
 Binding to an output fixes both problems at once: input goes to the right screen, and the device picks up that output's transform.
 
-> **Verifying this is physical only.** There is no CLI check. `hyprctl devices -j` reports no output field for touch devices, and `hyprctl getoption device:<name>:<key>` returns `no such option` for *every* device key — including known-good ones on an ordinary mouse — so it can't confirm or deny a binding. A clean `hyprctl configerrors` tells you the config parsed, nothing more. Test by touching each screen.
+> **Verifying this is physical only.** There is no CLI check for device bindings on this build — see [Tooling notes](#tooling-notes). Test by touching each screen.
 
 ---
 
@@ -192,6 +194,18 @@ Verified on the system above: clean `hyprctl reload`, no config errors, layout s
 
 **Not yet verified:** persistence across a full reboot. The `autostart.lua` sync is there to handle `systemd-backlight` restoring the panels at different levels, but it hasn't been observed across an actual reboot cycle yet.
 
+## Tooling notes
+
+Two things that cost real time on this machine and aren't obvious from any error message.
+
+**`hyprctl keyword` does not work on Omarchy.** Omarchy configures Hyprland in Lua, so you get `keyword can't work with non-legacy parsers. Use eval.` Use `hyprctl eval` with the Lua helper instead:
+
+```bash
+hyprctl eval 'hl.monitor({ output = "eDP-1", mode = "2880x1800@60", position = "0x0", scale = 2, transform = 2 })'
+```
+
+**Device config cannot be verified from the CLI.** `hyprctl getoption device:<name>:<key>` returns `no such option` for *every* device key, including known-good ones on an ordinary mouse — it isn't reporting that your binding failed, it simply doesn't support device sections. `hyprctl devices -j` likewise exposes no output field for touch devices. A clean `hyprctl configerrors` tells you the config parsed and nothing more. Anything touch- or tablet-related has to be verified by hand.
+
 ## Open items
 
 Found during a survey of the machine but not fixed. Listed with the evidence so nobody has to re-derive it. Contributions welcome.
@@ -208,6 +222,15 @@ event13 - touch-arbitration: activated for ...Stylus Bottom<->...Touchscreen Bot
 ```
 
 So resting a hand on the upper panel while drawing on it won't be arbitrated. This is below Hyprland — it needs a libinput quirks file, not compositor config.
+
+### The emulated touchpad advertises a right button it shouldn't
+
+```
+[libinput] event14 - INGENIC Gadget Serial and keyboard Emulated Touchpad:
+    kernel bug: clickpad advertising right button
+```
+
+The firmware's virtual touchpad on the lower panel declares itself a clickpad *and* advertises a physical right button, which libinput calls out as a [kernel bug](https://wayland.freedesktop.org/libinput/doc/1.31.3/clickpad-with-right-button.html). Expect right-click on the virtual touchpad to behave oddly. Fixing it properly means a libinput quirks file or a kernel-side fix; `clickfinger_behavior` in `input.lua` may be a usable workaround.
 
 ### Speaker amp calibration fails
 
