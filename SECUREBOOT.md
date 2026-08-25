@@ -1,6 +1,14 @@
 # Secure Boot and TPM unlock
 
-**Status: Secure Boot enabled and verified. TPM enrolled and the initramfs switched — awaiting a reboot to confirm auto-unlock.**
+**Status: complete and verified.** Secure Boot is enabled with our own keys, and the disk unlocks from the TPM with no passphrase prompt and no keyboard. Confirmed across a reboot:
+
+```
+$ cat /proc/cmdline          # rd.luks.name=<uuid>=root  (new unlock path in use)
+$ sbctl status               # Secure Boot: Enabled, Vendor Keys: microsoft
+$ journalctl -b | grep crypt # systemd-cryptsetup@root.service, no prompt
+```
+
+Read the security caveat under "The UKI carries no embedded command line" before treating this as measured boot — it is not.
 
 ## Why bother
 
@@ -87,7 +95,7 @@ actual=$(b2sum /boot/EFI/Linux/omarchy_linux.efi | cut -d' ' -f1)
 1. ~~**BIOS:** clear/erase keys to reach Setup Mode, leaving Secure Boot off.~~ **Done.** On this Insyde firmware the option sits under Security → Secure Boot. `sbctl status` then reported `Setup Mode: Enabled`, `Vendor Keys: none`.
 2. ~~**Enrol:** `sbctl enroll-keys -m`.~~ **Done.** The `-m` keeps Microsoft's vendor keys, which matters on a Lenovo — firmware capsule updates and option ROMs are signed with them, and dropping them can break firmware updates. Status afterwards: `Setup Mode: Disabled`, `Vendor Keys: microsoft`.
 3. **BIOS again:** enable Secure Boot. Confirm with `bootctl status` (`Secure Boot: enabled`) or `sbctl status`. **← next**
-4. ~~**TPM:**~~ **Done, pending reboot.** See below. That needs the initramfs switched from the `encrypt` hook to `sd-encrypt`, the `cryptdevice=` parameter replaced with `rd.luks.*`, and `systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7`. PCR 7 is the Secure Boot state, which is the whole point of doing it in this order. Keep the passphrase keyslot as a fallback.
+4. ~~**TPM:**~~ **Done and verified.** See below. That needs the initramfs switched from the `encrypt` hook to `sd-encrypt`, the `cryptdevice=` parameter replaced with `rd.luks.*`, and `systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7`. PCR 7 is the Secure Boot state, which is the whole point of doing it in this order. Keep the passphrase keyslot as a fallback.
 
 Keep a USB keyboard attached throughout: firmware setup and the LUKS prompt both need one.
 

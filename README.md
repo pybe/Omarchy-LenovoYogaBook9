@@ -290,7 +290,7 @@ No configuration fixes this. You need a USB keyboard to boot, or you need to rem
 sddm-helper: pam_unix(sddm-autologin:session): session opened for user <you>
 ```
 
-**Work on this is under way — see [SECUREBOOT.md](SECUREBOOT.md).** The prompt can be removed by enrolling the TPM, and the hardware supports it — TPM 2.0 at `/dev/tpm0`, LUKS2 with a single pbkdf2 keyslot and no TPM token. It requires switching the initramfs from the `encrypt` hook to `sd-encrypt`. **Weigh this carefully if Secure Boot is disabled**, as it is here: PCR-bound unlocking is materially weaker when unsigned code can boot and satisfy the same policy. Not done on this machine.
+**Solved on this machine — see [SECUREBOOT.md](SECUREBOOT.md).** Secure Boot was re-enabled with self-enrolled keys and the disk now unlocks from the TPM, so there is no passphrase prompt and no keyboard needed at boot. The prompt can be removed by enrolling the TPM, and the hardware supports it — TPM 2.0 at `/dev/tpm0`, LUKS2 with a single pbkdf2 keyslot and no TPM token. It requires switching the initramfs from the `encrypt` hook to `sd-encrypt`. **Weigh this carefully if Secure Boot is disabled**, as it is here: PCR-bound unlocking is materially weaker when unsigned code can boot and satisfy the same policy. Not done on this machine.
 
 ### Stylus palm rejection is paired to the wrong panel
 
