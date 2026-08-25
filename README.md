@@ -183,13 +183,20 @@ Total silence means the woofers are getting nothing. Turn `numid=7` back on afte
 
 Everything in the mixer looks correct, which is what makes this confusing: `Bass Speaker Playback Switch` is on, `DAC2 Playback Volume` is at maximum, the pin has `Pin-ctls: 0x40: OUT` and EAPD asserted. The problem is upstream of the mixer.
 
-Related, and probably the same root cause — no model-specific codec quirk matched:
+**Root cause: the two speaker pins are on different DACs.**
 
 ```
-snd_hda_codec_alc269 ehdaudio0D0: ALC287: picked fixup  for PCI SSID 17aa:3843
+Node 0x14 (woofers):   Connection: 1  ->  0x02
+Node 0x17 (tweeters):  Connection: 4  ->  0x02  0x03*  0x06  0x08
 ```
 
-Note the blank fixup name. The kernel does contain `ALC287_FIXUP_LENOVO_YOGA_BOOK_9I`, but it has no model string, so it cannot be forced with a module parameter — it only applies via the SSID quirk table.
+A stereo stream reaches one DAC pair, so the woofers receive nothing. Both pins also carry byte-identical defaults (`0x90170110`, association 1, sequence 0), which is why the parser cannot tell them apart and splits them into front and surround.
+
+**The codec quirk does match** — an earlier version of this file said otherwise, misreading the blank name in `ALC287: picked fixup  for PCI SSID 17aa:3843`. That blank means the entry has no name string, not that nothing matched. `SND_PCI_QUIRK(0x17aa, 0x3843, ...)` resolves via subsystem `0x17aa3881` to `ALC287_FIXUP_TAS2781_I2C`, which wires up the amp and **never touches routing**. Sibling machines at `0x17aa3882` get `ALC287_FIXUP_YOGA9_14IAP7_BASS_SPK_PIN`, which forces both speaker pins onto DAC `0x02` via a `preferred_pairs` table. This machine does not.
+
+**Userspace cannot fix it, and this was tested.** `hda-verb ... SET_CONNECT_SEL 0` does put both pins on DAC `0x02`, and it is audibly better — but the driver re-asserts its own routing every few seconds. A service that fought back produced seven re-assertions in sixteen seconds, an oscillating DAC selection. `preferred_pairs` has no userspace interface, and a pin config cannot express "both pins share a DAC" because distinct sequence numbers are what create the front/surround split in the first place.
+
+So the workaround below is not a stopgap awaiting something better — it is the correct answer until the kernel is patched.
 
 ### Fix
 
@@ -208,6 +215,8 @@ wpctl inspect @DEFAULT_AUDIO_SINK@ | grep audio.channels    # expect 4
 ```
 
 Bass returns immediately. Pure userspace, no kernel patch, survives kernel updates.
+
+**Known limitation.** `psd` upmix derives the rear channels from the left/right *difference*, and bass is centred in almost every mix, so the woofers receive comparatively little of it. The practical effect is that bass thins as volume drops — noticeably below roughly 60%. Some thinning at low volume is normal human hearing rather than a fault, but this makes it worse. It is inherent to feeding woofers by upmix, and cannot be tuned away; only the kernel fix removes it.
 
 ### The amp has a tuning profile for this exact machine
 
