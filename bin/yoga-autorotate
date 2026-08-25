@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""Switch display modes from the accelerometer.
+
+Three of the four usage modes are distinguishable by orientation alone:
+
+    normal     -> stand      (stacked landscape)
+    left-up    -> book       (two portrait screens)
+    right-up   -> book-flip  (book, turned the other way)
+    bottom-up  -> ignored    (machine inverted; no sensible mapping)
+
+Present mode is deliberately never entered automatically: it is a decision
+about who is looking at the screen, not a physical orientation, so no sensor
+can infer it. Choosing it by hand also suspends auto-switching until you leave
+it, so this never overrides a deliberate choice.
+
+The hinge sensor would have distinguished a genuine fold from the machine
+merely being tilted, but it reads 0 permanently on this hardware. A stability
+delay stands in for it: an orientation must persist before it is acted on.
+"""
+
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib  # noqa: E402
+
+CONFIG_PATH = Path(
+    os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")
+) / "yoga-autorotate.conf"
+
+MODE_FILE = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "yoga-mode"
+
+POLL_SECONDS = 1
+STABLE_READINGS = 4   # ~4s of agreement before acting
+
+ORIENTATION_TO_MODE = {
+    "normal": "stand",
+    "left-up": "book",
+    "right-up": "book-flip",
+}
+
+
+def enabled():
+    """Read fresh each poll so toggling applies without a restart."""
+    try:
+        for line in CONFIG_PATH.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, _, value = line.partition("=")
+            if key.strip() == "enabled":
+                return value.strip().lower() in ("1", "true", "yes", "on")
+    except OSError:
+        pass
+    return True
+
+
+def current_mode():
+    try:
+        return MODE_FILE.read_text().strip()
+    except OSError:
+        return "stand"
+
+
+def apply_mode(mode):
+    try:
+        subprocess.run(["yoga-mode", mode], capture_output=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+class Accelerometer:
+    def __init__(self):
+        self.bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        for _ in range(30):
+            try:
+                self._claim()
+                return
+            except GLib.Error:
+                time.sleep(2)
+        raise SystemExit("iio-sensor-proxy did not appear on the bus")
+
+    def _claim(self):
+        self.bus.call_sync(
+            "net.hadess.SensorProxy", "/net/hadess/SensorProxy",
+            "net.hadess.SensorProxy", "ClaimAccelerometer", None, None,
+            Gio.DBusCallFlags.NONE, -1, None,
+        )
+
+    def release(self):
+        try:
+            self.bus.call_sync(
+                "net.hadess.SensorProxy", "/net/hadess/SensorProxy",
+                "net.hadess.SensorProxy", "ReleaseAccelerometer", None, None,
+                Gio.DBusCallFlags.NONE, -1, None,
+            )
+        except GLib.Error:
+            pass
+
+    def orientation(self):
+        value = self.bus.call_sync(
+            "net.hadess.SensorProxy", "/net/hadess/SensorProxy",
+            "org.freedesktop.DBus.Properties", "Get",
+            GLib.Variant("(ss)", ("net.hadess.SensorProxy",
+                                  "AccelerometerOrientation")),
+            None, Gio.DBusCallFlags.NONE, -1, None,
+        )
+        return value.unpack()[0]
+
+
+def main():
+    accel = Accelerometer()
+
+    def shutdown(*_):
+        accel.release()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    pending = None
+    count = 0
+
+    while True:
+        time.sleep(POLL_SECONDS)
+
+        if not enabled():
+            continue
+
+        # Present mode is a deliberate choice; never override it.
+        if current_mode() == "present":
+            pending, count = None, 0
+            continue
+
+        try:
+            orientation = accel.orientation()
+        except GLib.Error:
+            try:
+                accel._claim()
+            except GLib.Error:
+                pass
+            continue
+
+        target = ORIENTATION_TO_MODE.get(orientation)
+        if target is None:
+            pending, count = None, 0
+            continue
+
+        if target == pending:
+            count += 1
+        else:
+            pending, count = target, 1
+
+        # Only act once the orientation has settled, and only if it is a change.
+        if count == STABLE_READINGS and target != current_mode():
+            apply_mode(target)
+
+
+if __name__ == "__main__":
+    main()

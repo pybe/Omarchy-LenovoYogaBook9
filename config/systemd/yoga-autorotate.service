@@ -1,0 +1,15 @@
+[Unit]
+Description=Switch Yoga Book 9 display modes from the accelerometer
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/yoga-autorotate
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Install]
+WantedBy=graphical-session.target

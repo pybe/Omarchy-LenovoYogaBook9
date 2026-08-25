@@ -51,17 +51,44 @@ mode_present() {
 
 current() { cat "$MODE_FILE" 2>/dev/null || echo stand; }
 
+# Changing the layout can make the shell rewrite its own config and relocate
+# the bar -- observed moving from top to left during a mode switch. Capture the
+# configured position before switching and put it back afterwards, so the
+# user's choice survives.
+SHELL_JSON="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/shell.json"
+
+bar_position() {
+  python3 -c "import json,sys
+try: print(json.load(open(sys.argv[1]))['bar']['position'])
+except Exception: pass" "$SHELL_JSON" 2>/dev/null
+}
+
+restore_bar_position() {
+  local want="$1" have
+  [ -n "$want" ] || return 0
+  sleep 1
+  have="$(bar_position)"
+  [ "$have" = "$want" ] && return 0
+  python3 -c "import json,sys
+p,want=sys.argv[1],sys.argv[2]
+d=json.load(open(p)); d['bar']['position']=want
+open(p,'w').write(json.dumps(d,indent=2)+'\n')" "$SHELL_JSON" "$want" 2>/dev/null &&
+    echo "restored bar position: $have -> $want"
+}
+
 notify() {
   command -v omarchy-notification-send >/dev/null &&
     omarchy-notification-send -u low "Display mode: $1"
   echo "display mode: $1"
 }
 
+WANTED_BAR="$(bar_position)"
+
 case "${1:-cycle}" in
-stand | laptop) mode_stand;   echo stand   > "$MODE_FILE"; notify stand ;;
-book)               mode_book;      echo book      > "$MODE_FILE"; notify "book" ;;
-book-flip | book2)  mode_book_flip; echo book-flip > "$MODE_FILE"; notify "book (other way)" ;;
-present | tent) mode_present; echo present > "$MODE_FILE"; notify present ;;
+stand | laptop) mode_stand;   echo stand   > "$MODE_FILE"; restore_bar_position "$WANTED_BAR"; notify stand ;;
+book)               mode_book;      echo book      > "$MODE_FILE"; restore_bar_position "$WANTED_BAR"; notify "book" ;;
+book-flip | book2)  mode_book_flip; echo book-flip > "$MODE_FILE"; restore_bar_position "$WANTED_BAR"; notify "book (other way)" ;;
+present | tent) mode_present; echo present > "$MODE_FILE"; restore_bar_position "$WANTED_BAR"; notify present ;;
 cycle)
   case "$(current)" in
   stand)     "$0" book ;;

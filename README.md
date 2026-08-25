@@ -339,7 +339,15 @@ yoga-mode cycle        # step through them
 
 **`hyprctl keyword` does not work** under Omarchy's Lua parser; these go through `hyprctl eval`.
 
-### Auto-rotation: partly possible, and why it is not automatic
+### The bar moves with the screen edge
+
+The status bar anchors to a screen *edge*, and a rotated screen takes its edges with it. A bar on the `left` therefore appears along the visual top in book mode. That is layer-shell working correctly, not a fault — but it surprises you the first time.
+
+Set `bar.position` to `top` in `~/.config/omarchy/shell.json` and it reads as the visual top in every mode, since layer anchoring is done in the output's logical (post-transform) space.
+
+Switching layout can also make the shell rewrite its own config and relocate the bar. `yoga-mode` captures `bar.position` before switching and restores it afterwards, so the choice survives.
+
+### Auto-rotation
 
 The accelerometer works well. All four orientations report reliably, along with tilt:
 
@@ -356,7 +364,26 @@ That matters because the hinge angle is what would distinguish "folded into a ta
 
 And **present mode is not an orientation at all** — it is a choice about who is looking. No sensor can infer it.
 
-So mode switching is manual by design. Auto-rotation could reasonably be layered on for the book positions, with a stability delay, but it can never cover all three modes.
+Three of the four modes *are* distinguishable, which is enough to be useful. [`bin/yoga-autorotate`](bin/yoga-autorotate) maps them:
+
+```
+normal    -> stand
+left-up   -> book
+right-up  -> book-flip
+bottom-up -> ignored
+```
+
+```bash
+install -Dm755 bin/yoga-autorotate ~/.local/bin/yoga-autorotate
+install -Dm644 config/yoga-autorotate.conf ~/.config/yoga-autorotate.conf
+install -Dm644 config/systemd/yoga-autorotate.service \
+  ~/.config/systemd/user/yoga-autorotate.service
+systemctl --user daemon-reload && systemctl --user enable --now yoga-autorotate
+```
+
+Two deliberate restraints. It **never enters present mode automatically**, because that is a decision about who is looking rather than an orientation. And choosing present by hand **suspends auto-switching** until you leave it, so it cannot override a deliberate choice.
+
+The missing hinge is covered by requiring an orientation to hold for about four seconds before acting — without it, a genuine fold and an incidental tilt look identical. Disable with `enabled = false` in `~/.config/yoga-autorotate.conf`, which is re-read every poll.
 
 ---
 
