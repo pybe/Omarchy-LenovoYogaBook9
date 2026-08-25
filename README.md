@@ -364,15 +364,15 @@ Inspect it live with [`bin/yoga-orientation`](bin/yoga-orientation), which also 
 
 That matters because the hinge angle is what would distinguish "folded into a tablet" from "picked the laptop up and tilted it". Without it, orientation alone cannot tell a deliberate mode change from incidental movement.
 
-And **present mode is not an orientation at all** — it is a choice about who is looking. No sensor can infer it.
+**Present mode *is* an orientation**, and I initially got this wrong. It is the machine folded in half so one screen faces each person — a distinct physical position, reported as `bottom-up`. I had assumed it was a preference about who was looking, concluded no sensor could detect it, and mapped `bottom-up` to "ignored", discarding the very orientation that identifies it.
 
-Three of the four modes *are* distinguishable, which is enough to be useful. [`bin/yoga-autorotate`](bin/yoga-autorotate) maps them:
+All four are distinguishable. [`bin/yoga-autorotate`](bin/yoga-autorotate) maps them one to one:
 
 ```
-normal    -> stand
-left-up   -> book
-right-up  -> book-flip
-bottom-up -> ignored
+normal    -> stand       stacked landscape
+left-up   -> book        turned 90 degrees, two portrait screens
+right-up  -> book-flip   turned the other way
+bottom-up -> present     folded in half, upper panel facing away
 ```
 
 ```bash
@@ -383,7 +383,7 @@ install -Dm644 config/systemd/yoga-autorotate.service \
 systemctl --user daemon-reload && systemctl --user enable --now yoga-autorotate
 ```
 
-Two deliberate restraints. It **never enters present mode automatically**, because that is a decision about who is looking rather than an orientation. And choosing present by hand **suspends auto-switching** until you leave it, so it cannot override a deliberate choice.
+All four positions switch automatically. An earlier version excluded present on the mistaken belief it was undetectable, which also required a guard suspending auto-switching while present was active — that would have trapped the machine in present mode once present became detectable. Both are gone.
 
 The missing hinge is covered by requiring an orientation to hold for about four seconds before acting — without it, a genuine fold and an incidental tilt look identical. Disable with `enabled = false` in `~/.config/yoga-autorotate.conf`, which is re-read every poll.
 
