@@ -492,7 +492,22 @@ So resting a hand on the upper panel while drawing on it won't be arbitrated. Th
     kernel bug: clickpad advertising right button
 ```
 
-The firmware's virtual touchpad on the lower panel declares itself a clickpad *and* advertises a physical right button, which libinput calls out as a [kernel bug](https://wayland.freedesktop.org/libinput/doc/1.31.3/clickpad-with-right-button.html). Expect right-click on the virtual touchpad to behave oddly. Fixing it properly means a libinput quirks file or a kernel-side fix; `clickfinger_behavior` in `input.lua` may be a usable workaround.
+The firmware's virtual touchpad on the lower panel declares itself a clickpad *and* advertises a physical right button, which libinput calls out as a [kernel bug](https://wayland.freedesktop.org/libinput/doc/1.31.3/clickpad-with-right-button.html).
+
+**Fixed** by [`config/libinput/local-overrides.quirks`](config/libinput/local-overrides.quirks), which removes the phantom button so clickfinger behaviour supplies right-click instead. Install it to `/etc/libinput/local-overrides.quirks` — libinput reads **only** that path, and a copy under `~/.config/libinput/` is silently ignored. Quirks apply when a device is added, so it takes effect on the next boot.
+
+Two traps, both of which cost a reboot each:
+
+**The attribute is `AttrEventCode=-BTN_RIGHT`.** `AttrEventCodeDisable` is not a libinput attribute — it appears nowhere in `/usr/share/libinput/*.quirks`, and an unrecognised attribute makes the whole section be ignored with no error the user ever sees. The file sits in the right path, matches the device, and does nothing. Check syntax against the shipped quirks; `30-vendor-hantick.quirks` disables `BTN_RIGHT` on another touchpad as a working precedent.
+
+**Verify by the quirk being applied, not by the warning disappearing.**
+
+```bash
+grep "disabling EV_KEY BTN_RIGHT" $XDG_RUNTIME_DIR/hypr/*/hyprland.log
+# [libinput] event9 - quirks: disabling EV_KEY BTN_RIGHT (0x1 0x111)
+```
+
+libinput logs the `kernel bug: clickpad advertising right button` notice *after* applying the quirk, because that line describes the hardware rather than libinput's resulting state. Its absence is not the success signal — it persists when the quirk works.
 
 ### Speaker amp calibration fails
 
