@@ -116,7 +116,7 @@ brightnessctl -d intel_backlight set 40%         # upper panel only
 ## Applying all of it
 
 ```bash
-git clone https://github.com/<you>/Omarchy-LenovoYogaBook9
+git clone https://github.com/pybe/Omarchy-LenovoYogaBook9
 cd Omarchy-LenovoYogaBook9
 
 install -Dm755 bin/yoga-brightness ~/.local/bin/yoga-brightness
