@@ -1,0 +1,13 @@
+[Unit]
+Description=Ambient-light brightness for both Yoga Book 9 panels
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/yoga-autobrightness
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

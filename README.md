@@ -248,6 +248,36 @@ Whichever you choose, the equaliser is only tone shaping. The 4-channel fix abov
 
 ---
 
+## Auto-brightness from the ambient light sensor
+
+Not a quirk — a feature the hardware supports and nothing ships to use. Requires `iio-sensor-proxy`.
+
+[`bin/yoga-autobrightness`](bin/yoga-autobrightness) reads the ALS over D-Bus and drives **both** backlights, with a [systemd user unit](config/systemd/yoga-autobrightness.service) to keep it running:
+
+```bash
+sudo pacman -S --needed iio-sensor-proxy && sudo systemctl enable --now iio-sensor-proxy
+install -Dm755 bin/yoga-autobrightness ~/.local/bin/yoga-autobrightness
+install -Dm644 config/systemd/yoga-autobrightness.service \
+  ~/.config/systemd/user/yoga-autobrightness.service
+systemctl --user daemon-reload && systemctl --user enable --now yoga-autobrightness
+```
+
+Three details that matter more than the sensor reading itself:
+
+- **It sets both backlights directly** rather than calling `omarchy-brightness-display`, which resolves its target from the *focused monitor* — meaningless for a background daemon.
+- **The curve is logarithmic.** Perceived brightness tracks the log of illuminance, so a linear map wastes most of its range on daylight levels nobody sits in. Roughly: 0 lux → 10%, 50 → 47%, 1000 → 76%, 10000 → 98%.
+- **It stands down when you adjust brightness by hand.** If the panel is not where the daemon last left it, someone else moved it, so it pauses for ten minutes rather than fighting you. A threshold also stops it hunting over small fluctuations — the ALS drifts a few lux at rest.
+
+The sensor only reports while claimed, so the daemon calls `ClaimLight` on start and `ReleaseLight` on exit:
+
+```bash
+busctl call net.hadess.SensorProxy /net/hadess/SensorProxy net.hadess.SensorProxy ClaimLight
+busctl get-property net.hadess.SensorProxy /net/hadess/SensorProxy net.hadess.SensorProxy LightLevel
+# d 73.025
+```
+
+---
+
 ## Applying all of it
 
 ```bash
@@ -426,22 +456,23 @@ snd_hda_codec_alc269 ehdaudio0D0: autoconfig for ALC287: line_outs=2 type:speake
 snd_hda_codec_alc269 ehdaudio0D0:    speaker_outs=0
 ```
 
-### No sensor daemon, despite good sensor hardware
+### Sensors work; auto-rotation still unwired
 
-`iio-sensor-proxy` is not installed, so nothing reacts to orientation, folding, or ambient light. The hardware is all present and live under `/sys/bus/iio/devices/`:
+`iio-sensor-proxy` is not installed by default. Once installed, everything reports correctly:
+
+```
+=== Has accelerometer (orientation: normal, tilt: vertical)
+=== Has ambient light sensor (value: 95.109005, unit: lux)
+```
 
 | Sensor | Notes |
 |---|---|
-| `als` | Working — returns real readings from `in_illuminance_raw` |
-| `accel_3d` | Present |
+| `als` | Working — drives auto-brightness, see below |
+| `accel_3d` | Present, reports orientation |
 | `gyro_3d` (x2) | Present |
 | `hinge` | Exposes **three** angles: `in_angl0_raw` (hinge), `in_angl1_raw` (screen), `in_angl2_raw` (keyboard) |
 
-That three-angle hinge sensor is the obvious signal for auto-switching display modes on a machine like this. Read 0 across all three while stationary during the survey; whether that needs the daemon driving it or just movement wasn't established.
-
-### No firmware update path
-
-`fwupd` isn't installed. BIOS is `KXCN41WW`, dated 2024-12-19. Given how much of this machine's behaviour is firmware-driven, worth having.
+**Auto-brightness is done** — see below. **Auto-rotation is not**, and needs care: the accelerometer reports orientation `normal` while `eDP-1` carries `transform = 2` because the panel is mounted 180° out. Rotation logic that ignores that offset will land 180° wrong. The three-angle hinge sensor is the obvious signal for switching display modes on a machine that folds.
 
 ### Battery charge limiting — available, but not where you would look
 

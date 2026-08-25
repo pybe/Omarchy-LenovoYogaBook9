@@ -1,0 +1,88 @@
+#!/bin/bash
+
+# Ambient-light-driven brightness for the Yoga Book 9's two internal panels.
+#
+# Reads the ALS through iio-sensor-proxy's D-Bus interface and drives both
+# backlights. The second panel is set directly rather than through
+# omarchy-brightness-display, which resolves its target from the focused
+# monitor -- unhelpful for a background daemon.
+#
+# Backs off when brightness is changed by hand: if the panel is not where this
+# script last left it, someone else moved it, so auto-adjustment pauses.
+
+set -u
+
+PRIMARY=intel_backlight
+SECONDARY=card1-eDP-2-backlight
+
+POLL_SECS=5
+MIN_PCT=10
+MAX_PCT=100
+STEP_THRESHOLD=5      # ignore changes smaller than this, to stop it hunting
+MANUAL_PAUSE_SECS=600 # how long to leave it alone after a manual change
+
+last_set=-1
+paused_until=0
+
+current_pct() {
+  brightnessctl -d "$PRIMARY" -m 2>/dev/null | awk -F, '{ gsub("%","",$4); print $4 }'
+}
+
+lux_to_pct() {
+  # Logarithmic: perceived brightness tracks log of illuminance, so a linear
+  # map would spend most of its range on daylight levels nobody sits in.
+  awk -v l="$1" -v lo="$MIN_PCT" -v hi="$MAX_PCT" 'BEGIN {
+    p = 10 + 22 * log(l + 1) / log(10)
+    if (p < lo) p = lo
+    if (p > hi) p = hi
+    printf "%d", p
+  }'
+}
+
+cleanup() {
+  busctl call net.hadess.SensorProxy /net/hadess/SensorProxy \
+    net.hadess.SensorProxy ReleaseLight >/dev/null 2>&1
+  exit 0
+}
+trap cleanup TERM INT EXIT
+
+# The sensor only reports while claimed.
+busctl call net.hadess.SensorProxy /net/hadess/SensorProxy \
+  net.hadess.SensorProxy ClaimLight >/dev/null 2>&1 || {
+  echo "could not claim the light sensor -- is iio-sensor-proxy running?" >&2
+  exit 1
+}
+
+while :; do
+  now=$(date +%s)
+  cur=$(current_pct)
+
+  # Someone moved it by hand -> stand down for a while.
+  if [[ -n $cur && $last_set -ge 0 ]]; then
+    diff=$(( cur > last_set ? cur - last_set : last_set - cur ))
+    if (( diff > 2 )); then
+      paused_until=$(( now + MANUAL_PAUSE_SECS ))
+      last_set=$cur
+    fi
+  fi
+
+  if (( now >= paused_until )); then
+    lux=$(busctl get-property net.hadess.SensorProxy /net/hadess/SensorProxy \
+          net.hadess.SensorProxy LightLevel 2>/dev/null | awk '{print $2}')
+    if [[ -n ${lux:-} ]]; then
+      target=$(lux_to_pct "$lux")
+      if [[ -n $cur ]]; then
+        delta=$(( target > cur ? target - cur : cur - target ))
+      else
+        delta=99
+      fi
+      if (( delta >= STEP_THRESHOLD )); then
+        brightnessctl -d "$PRIMARY"   set "${target}%" >/dev/null 2>&1
+        brightnessctl -d "$SECONDARY" set "${target}%" >/dev/null 2>&1
+        last_set=$target
+      fi
+    fi
+  fi
+
+  sleep "$POLL_SECS"
+done
