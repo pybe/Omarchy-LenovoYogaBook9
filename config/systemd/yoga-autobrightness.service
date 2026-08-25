@@ -8,6 +8,12 @@ Type=simple
 ExecStart=%h/.local/bin/yoga-autobrightness
 Restart=always
 RestartSec=5
+# Without a start limit, a daemon that dies instantly at startup (missing
+# python-gobject, absent sensor, renamed backlight) crash-loops forever showing
+# "activating (auto-restart)" and never reaches "failed", so the breakage is
+# never surfaced. At RestartSec=5 the systemd defaults never trip.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Install]
 WantedBy=graphical-session.target

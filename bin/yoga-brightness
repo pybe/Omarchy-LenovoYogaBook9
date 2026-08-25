@@ -18,9 +18,26 @@ case "${*: -1}" in
 --no-osd | off | on) exit 0 ;;
 esac
 
-# An external DDC monitor being focused must not drag eDP-2 along with it.
-focused="$(omarchy-hyprland-monitor-focused 2>/dev/null || true)"
-[[ $focused =~ ^(eDP|LVDS|DSI)- ]] || exit 0
+# An external DDC monitor being targeted must not drag eDP-2 along with it.
+#
+# Honour --monitor if given, since this wrapper stands in for a command that
+# supports it; otherwise ask which monitor has focus.
+target_monitor=""
+prev=""
+for arg in "$@"; do
+  [[ $prev == "--monitor" ]] && { target_monitor="$arg"; break; }
+  prev="$arg"
+done
+[[ -n $target_monitor ]] || target_monitor="$(omarchy-hyprland-monitor-focused 2>/dev/null || true)"
+
+# An EMPTY result means we could not ask -- hyprctl not answering yet, or this
+# was invoked from a systemd unit or a TTY. Treat that as internal and mirror
+# anyway: the autostart login sync runs in exactly that situation, and bailing
+# out here silently made it a no-op, leaving eDP-2 at whatever systemd-backlight
+# restored. Only skip when we positively know the target is external.
+if [[ -n $target_monitor && ! $target_monitor =~ ^(eDP|LVDS|DSI)- ]]; then
+  exit 0
+fi
 
 pct="$(brightnessctl -d "$PRIMARY" -m 2>/dev/null | awk -F, '{ gsub("%", "", $4); print $4 }')"
 [[ -n $pct ]] || exit 0

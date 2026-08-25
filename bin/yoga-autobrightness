@@ -1,110 +1,196 @@
-#!/bin/bash
+#!/usr/bin/env python3
+"""Ambient-light brightness for the Lenovo Yoga Book 9's two internal panels.
 
-# Ambient-light-driven brightness for the Yoga Book 9's two internal panels.
-#
-# Reads the ALS via monitor-sensor and drives both backlights.
-#
-# Why monitor-sensor rather than polling the D-Bus property: iio-sensor-proxy
-# ties a light claim to the *connection* that made it. Each `busctl call
-# ClaimLight` opens a connection, claims, and exits -- dropping the claim
-# instantly. The sensor then powers down and LightLevel reads 0 forever, which
-# looks exactly like a broken sensor. monitor-sensor holds one connection open
-# for its lifetime, so the claim persists and readings keep flowing.
-#
-# The second panel is set directly rather than through
-# omarchy-brightness-display, which resolves its target from the focused
-# monitor -- meaningless for a background daemon.
-#
-# Backs off when brightness is changed by hand: if a panel is not where this
-# script last left it, someone else moved it, so adjustment pauses.
+Why this is Python rather than a shell script, having tried both:
 
-set -u
+* A light claim is bound to the D-Bus *connection* that made it. Claiming with
+  `busctl call ClaimLight` and then polling the property cannot work: busctl
+  exits, the claim dies, the sensor powers down, and LightLevel returns 0
+  forever while HasAmbientLight still reports true. That looks exactly like
+  broken hardware. This holds one connection open for its lifetime.
 
-PRIMARY=intel_backlight
-SECONDARY=card1-eDP-2-backlight
+* `monitor-sensor` does hold a claim, but its output does not survive a pipe.
+  Measured on this machine: redirected straight to a file it writes ~17 lines
+  in 12s progressively; piped to `cat` the same lines arrive in one burst when
+  it exits; piped into a `while read` loop only the two startup lines ever
+  arrive. `stdbuf -oL` does not change that and a pty via `script` was no
+  better. Whatever the mechanism, a shell read loop cannot be driven from it.
 
-MIN_PCT=10
-MAX_PCT=100
-STEP_THRESHOLD=3      # ignore smaller changes, so it does not hunt
-APPLY_INTERVAL=2      # seconds; monitor-sensor emits far faster than this
-MANUAL_PAUSE_SECS=600
+Both backlights are set directly rather than via omarchy-brightness-display,
+which resolves its target from the focused monitor -- meaningless for a daemon.
+"""
 
-last_set=-1
-last_apply=0
-paused_until=0
+import signal
+import subprocess
+import sys
+import time
 
-current_pct() {
-  brightnessctl -d "$PRIMARY" -m 2>/dev/null | awk -F, '{ gsub("%","",$4); print $4 }'
-}
+import gi
 
-lux_to_pct() {
-  # Logarithmic, because perceived brightness tracks log of illuminance, and
-  # fitted to the range a room actually spans rather than the sensor's full
-  # scale. This panel reads ~70 lux for normal indoor light and ~30 covered; a
-  # curve stretched to daylight puts those a handful of percent apart and the
-  # feature goes unnoticed. Anchored at 30 lux -> 20% and 300 lux -> 85%, which
-  # is deliberately steep: a gentler fit was measurably working yet too subtle
-  # to perceive, which is the worst outcome -- it looks broken and is not.
-  awk -v l="$1" -v lo="$MIN_PCT" -v hi="$MAX_PCT" 'BEGIN {
-    p = -78 + 65.8 * log(l + 1) / log(10)
-    if (p < lo) p = lo
-    if (p > hi) p = hi
-    printf "%d", p
-  }'
-}
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib  # noqa: E402
 
-command -v monitor-sensor >/dev/null || {
-  echo "monitor-sensor not found -- install iio-sensor-proxy" >&2
-  exit 1
-}
+PRIMARY = "intel_backlight"
+SECONDARY = "card1-eDP-2-backlight"
 
-# monitor-sensor can exit (sensor hiccup, proxy restart). If it does, the
-# pipeline ends and this script would exit 0 -- which systemd reads as success
-# and, with Restart=on-failure, never restarts. Supervise it here instead.
-while :; do
-stdbuf -oL monitor-sensor 2>/dev/null | while IFS= read -r line; do
-  case "$line" in
-    *"Light changed"*|*"ambient light sensor"*) ;;
-    *) continue ;;
-  esac
+POLL_SECONDS = 2
+MIN_PCT = 10
+MAX_PCT = 100
+STEP_THRESHOLD = 3        # ignore smaller changes so it does not hunt
+MANUAL_TOLERANCE = 2      # rounding slack when checking for a manual change
+MANUAL_PAUSE_SECONDS = 600
 
-  lux=$(printf '%s' "$line" | grep -oE '[0-9]+\.[0-9]+' | head -1)
-  [[ -n ${lux:-} ]] || continue
+# Logarithmic, because perceived brightness tracks log illuminance, and fitted
+# to the range a room actually spans rather than the sensor's full scale. This
+# panel reads ~70 lux under normal indoor light and ~30 with the sensor
+# covered; a curve stretched to daylight puts those a few percent apart and the
+# feature goes unnoticed -- which is worse than failing, because it looks
+# broken. Anchored at 30 lux -> 20% and 300 lux -> 85%.
+CURVE_OFFSET = -78.0
+CURVE_SCALE = 65.8
 
-  now=$(date +%s)
-  (( now - last_apply >= APPLY_INTERVAL )) || continue
-  last_apply=$now
 
-  cur=$(current_pct)
+def lux_to_pct(lux):
+    import math
 
-  if [[ -n $cur && $last_set -ge 0 ]]; then
-    diff=$(( cur > last_set ? cur - last_set : last_set - cur ))
-    if (( diff > 2 )); then
-      paused_until=$(( now + MANUAL_PAUSE_SECS ))
-      last_set=$cur
-    fi
-  fi
+    pct = CURVE_OFFSET + CURVE_SCALE * math.log10(lux + 1)
+    return int(max(MIN_PCT, min(MAX_PCT, pct)))
 
-  (( now >= paused_until )) || continue
 
-  target=$(lux_to_pct "$lux")
-  if [[ -n $cur ]]; then
-    delta=$(( target > cur ? target - cur : cur - target ))
-  else
-    delta=99
-  fi
+def current_pct():
+    try:
+        out = subprocess.run(
+            ["brightnessctl", "-d", PRIMARY, "-m"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        return int(out.split(",")[3].rstrip("%"))
+    except Exception:
+        return None
 
-  if (( delta >= STEP_THRESHOLD )); then
-    brightnessctl -d "$PRIMARY"   set "${target}%" >/dev/null 2>&1
-    brightnessctl -d "$SECONDARY" set "${target}%" >/dev/null 2>&1
-    last_set=$target
-    # brightnessctl writes sysfs directly, which does not raise Omarchy's OSD --
-    # that is driven by omarchy-osd, called explicitly from the brightness keys.
-    # Show it here too so an automatic change is visible rather than mysterious.
-    command -v omarchy-osd >/dev/null && omarchy-osd -i brightness -p "$target" >/dev/null 2>&1 &
-  fi
-done
 
-  # monitor-sensor exited; pause briefly and bring it back.
-  sleep 3
-done
+def set_pct(pct):
+    for device in (PRIMARY, SECONDARY):
+        subprocess.run(
+            ["brightnessctl", "-d", device, "set", f"{pct}%"],
+            capture_output=True, timeout=5,
+        )
+    # brightnessctl writes sysfs directly and does not raise Omarchy's OSD --
+    # that comes from omarchy-osd, called explicitly by the brightness keys.
+    # Without it an automatic change is invisible and reads as a glitch.
+    #
+    # Guarded: omarchy-osd resolves only because /usr/share/omarchy/bin is on
+    # the user manager's PATH. Unguarded, its absence raises FileNotFoundError
+    # out of here and kills the daemon on the first adjustment -- which looks
+    # like "auto-brightness works for a few seconds after login, then stops".
+    try:
+        subprocess.Popen(
+            ["omarchy-osd", "-i", "brightness", "-p", str(pct)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        pass
+
+
+class Sensor:
+    """Holds the light claim for as long as this object lives."""
+
+    def __init__(self):
+        self.bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        self.claimed = False
+        # iio-sensor-proxy is a system service; a user unit cannot order
+        # against it, so at login it may not be on the bus yet. Retry rather
+        # than die and rely on the restart loop to paper over it.
+        for attempt in range(30):
+            try:
+                self.claim()
+                return
+            except GLib.Error:
+                time.sleep(2)
+        raise SystemExit("iio-sensor-proxy did not appear on the bus")
+
+    def claim(self):
+        self.bus.call_sync(
+            "net.hadess.SensorProxy", "/net/hadess/SensorProxy",
+            "net.hadess.SensorProxy", "ClaimLight", None, None,
+            Gio.DBusCallFlags.NONE, -1, None,
+        )
+        self.claimed = True
+
+    def release(self):
+        if not self.claimed:
+            return
+        try:
+            self.bus.call_sync(
+                "net.hadess.SensorProxy", "/net/hadess/SensorProxy",
+                "net.hadess.SensorProxy", "ReleaseLight", None, None,
+                Gio.DBusCallFlags.NONE, -1, None,
+            )
+        except GLib.Error:
+            pass
+        self.claimed = False
+
+    def lux(self):
+        value = self.bus.call_sync(
+            "net.hadess.SensorProxy", "/net/hadess/SensorProxy",
+            "org.freedesktop.DBus.Properties", "Get",
+            GLib.Variant("(ss)", ("net.hadess.SensorProxy", "LightLevel")),
+            None, Gio.DBusCallFlags.NONE, -1, None,
+        )
+        return value.unpack()[0]
+
+
+def main():
+    sensor = Sensor()
+
+    def shutdown(*_):
+        sensor.release()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    last_set = None
+    paused_until = 0.0
+
+    while True:
+        time.sleep(POLL_SECONDS)
+        now = time.monotonic()
+
+        current = current_pct()
+
+        # Not where we left it means someone adjusted it by hand. Stand down
+        # rather than fight a deliberate choice.
+        if current is not None and last_set is not None:
+            if abs(current - last_set) > MANUAL_TOLERANCE:
+                paused_until = now + MANUAL_PAUSE_SECONDS
+                last_set = current
+
+        if now < paused_until:
+            continue
+
+        try:
+            lux = sensor.lux()
+        except GLib.Error:
+            # iio-sensor-proxy restarted; re-establish the claim.
+            try:
+                sensor.claimed = False
+                sensor.claim()
+            except GLib.Error:
+                pass
+            continue
+
+        target = lux_to_pct(lux)
+
+        # An unreadable backlight must not mean "write unconditionally": that
+        # fires every tick forever, pops the OSD every tick, and permanently
+        # disables the manual-override check, which also needs a reading.
+        if current is None:
+            continue
+
+        if abs(target - current) >= STEP_THRESHOLD:
+            set_pct(target)
+            last_set = target
+
+
+if __name__ == "__main__":
+    main()

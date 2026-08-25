@@ -255,7 +255,8 @@ Not a quirk — a feature the hardware supports and nothing ships to use. Requir
 [`bin/yoga-autobrightness`](bin/yoga-autobrightness) reads the ALS over D-Bus and drives **both** backlights, with a [systemd user unit](config/systemd/yoga-autobrightness.service) to keep it running:
 
 ```bash
-sudo pacman -S --needed iio-sensor-proxy && sudo systemctl enable --now iio-sensor-proxy
+sudo pacman -S --needed iio-sensor-proxy python-gobject
+sudo systemctl enable --now iio-sensor-proxy
 install -Dm755 bin/yoga-autobrightness ~/.local/bin/yoga-autobrightness
 install -Dm644 config/systemd/yoga-autobrightness.service \
   ~/.config/systemd/user/yoga-autobrightness.service
@@ -265,7 +266,7 @@ systemctl --user daemon-reload && systemctl --user enable --now yoga-autobrightn
 Three details that matter more than the sensor reading itself:
 
 - **It sets both backlights directly** rather than calling `omarchy-brightness-display`, which resolves its target from the *focused monitor* — meaningless for a background daemon.
-- **The curve is logarithmic, and fitted to the range a room actually spans.** This is the part worth getting right. The panel reads roughly **70 lux for normal indoor lighting and 30 with the sensor covered** — a much narrower band than the sensor's full scale. A curve stretched to daylight puts those two states only eight percentage points apart, and the whole feature goes unnoticed; the first attempt here did exactly that. Anchoring instead at 30 lux → 34% and 300 lux → 79% makes ordinary changes in a room obvious while still reaching 100% outdoors:
+- **The curve is logarithmic, and fitted to the range a room actually spans.** This is the part worth getting right. The panel reads roughly **70 lux for normal indoor lighting and 30 with the sensor covered** — a much narrower band than the sensor's full scale. A curve stretched to daylight puts those two states only eight percentage points apart, and the whole feature goes unnoticed; the first attempt here did exactly that. Anchoring instead at 30 lux → 20% and 300 lux → 85% makes ordinary changes in a room obvious while still reaching 100% outdoors. A gentler fit was tried first and was measurably correct yet too subtle to perceive — the worst outcome, since it looks broken and is not:
 
   | lux | brightness |
   |---|---|
@@ -285,11 +286,19 @@ $ busctl get-property net.hadess.SensorProxy /net/hadess/SensorProxy net.hadess.
 d 0
 ```
 
-That reads as a dead sensor. It is not — nothing is holding the claim. `monitor-sensor` keeps one connection open for its lifetime, so the daemon runs it as a long-lived process and reads its output instead.
+That reads as a dead sensor. It is not — nothing is holding the claim. The daemon is Python precisely so one connection stays open for its lifetime.
 
-**A dying reader exits the script cleanly.** When `monitor-sensor` stops, the pipeline ends and the script exits `0`. systemd sees success, and `Restart=on-failure` correctly declines to restart it — leaving auto-brightness silently dead. The reader is supervised in a loop, and the unit uses `Restart=always`.
+**`monitor-sensor` holds a claim but cannot drive a shell loop.** The obvious alternative is to parse its output. Measured here:
 
-**`brightnessctl` does not raise the OSD.** It writes sysfs directly; Omarchy's on-screen slider comes from `omarchy-osd`, which the brightness keybindings call explicitly. Without it an automatic change is invisible and looks like a glitch, so the daemon calls `omarchy-osd -i brightness -p <pct>` after adjusting.
+| consumption | result |
+|---|---|
+| redirected to a file | ~17 lines in 12s, progressively |
+| piped to `cat` | same lines, all at once when it exits |
+| piped into `while read` | the two startup lines, then nothing |
+
+`stdbuf -oL` does not change this and a pty via `script` was no better. Whatever the mechanism, a shell read loop cannot be driven from it — hence D-Bus directly.
+
+**`brightnessctl` does not raise the OSD.** It writes sysfs directly; Omarchy's on-screen slider comes from `omarchy-osd`, which the brightness keybindings call explicitly. Without it an automatic change is invisible and looks like a glitch, so the daemon calls `omarchy-osd -i brightness -p <pct>` after adjusting — inside a `try`, since `omarchy-osd` resolves only because `/usr/share/omarchy/bin` is on the user manager's PATH, and an unguarded `Popen` would kill the daemon on its first adjustment.
 
 ---
 
@@ -301,11 +310,6 @@ cd Omarchy-LenovoYogaBook9
 
 install -Dm755 bin/yoga-brightness ~/.local/bin/yoga-brightness
 
-# Quirk 5 — bass speakers
-install -Dm644 config/wireplumber/51-yoga-bass-speakers.conf \
-  ~/.config/wireplumber/wireplumber.conf.d/51-yoga-bass-speakers.conf
-systemctl --user restart wireplumber
-
 # Back up first — these append to existing files.
 for f in monitors bindings autostart input; do
   cp ~/.config/hypr/$f.lua ~/.config/hypr/$f.lua.bak.$(date +%s)
@@ -314,6 +318,26 @@ done
 
 hyprctl reload
 hyprctl configerrors   # must print nothing
+
+# Quirk 5 — bass speakers
+install -Dm644 config/wireplumber/51-yoga-bass-speakers.conf \
+  ~/.config/wireplumber/wireplumber.conf.d/51-yoga-bass-speakers.conf
+systemctl --user restart wireplumber
+
+# Emulated touchpad: drop the phantom right button (root-owned path; libinput
+# reads only /etc/libinput, and applies quirks when a device is added, so this
+# takes effect on the next boot)
+sudo install -Dm644 config/libinput/local-overrides.quirks \
+  /etc/libinput/local-overrides.quirks
+
+# Auto-brightness
+sudo pacman -S --needed iio-sensor-proxy python-gobject
+sudo systemctl enable --now iio-sensor-proxy
+install -Dm755 bin/yoga-autobrightness ~/.local/bin/yoga-autobrightness
+install -Dm644 config/systemd/yoga-autobrightness.service \
+  ~/.config/systemd/user/yoga-autobrightness.service
+systemctl --user daemon-reload
+systemctl --user enable --now yoga-autobrightness
 ```
 
 Verify:

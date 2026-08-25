@@ -1,3 +1,6 @@
+# Install to /etc/libinput/local-overrides.quirks (root-owned).
+# libinput reads ONLY that path -- a copy under ~/.config/libinput/ is
+# silently ignored, which looks identical to the quirk not working.
 # Lenovo Yoga Book 9 13IRU8 (82YQ)
 
 [Yoga Book 9 Emulated Touchpad]
