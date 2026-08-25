@@ -10,4 +10,9 @@ MatchUdevType=touchpad
 # right button, which libinput reports as a kernel bug and which makes
 # right-click unreliable. Removing the bogus button leaves clickfinger
 # behaviour to provide right-click.
-AttrEventCodeDisable=BTN_RIGHT
+#
+# The attribute is AttrEventCode with a "-" prefix. AttrEventCodeDisable is
+# NOT a libinput attribute -- it appears nowhere in the shipped quirks, and an
+# unrecognised attribute makes the section be ignored with no error anywhere
+# the user will see it. Precedent: /usr/share/libinput/30-vendor-hantick.quirks
+AttrEventCode=-BTN_RIGHT
