@@ -20,15 +20,21 @@ Both backlights are set directly rather than via omarchy-brightness-display,
 which resolves its target from the focused monitor -- meaningless for a daemon.
 """
 
+import os
 import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import gi
 
 gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib  # noqa: E402
+
+CONFIG_PATH = Path(
+    os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")
+) / "yoga-autobrightness.conf"
 
 PRIMARY = "intel_backlight"
 SECONDARY = "card1-eDP-2-backlight"
@@ -48,6 +54,26 @@ MANUAL_PAUSE_SECONDS = 600
 # broken. Anchored at 30 lux -> 20% and 300 lux -> 85%.
 CURVE_OFFSET = -78.0
 CURVE_SCALE = 65.8
+
+
+def show_osd_enabled():
+    """Whether to raise the on-screen slider on an automatic change.
+
+    Read fresh each time rather than cached at startup, so toggling it takes
+    effect immediately instead of needing the service restarted. Defaults to
+    on: a brightness change with no visible cause reads as a glitch.
+    """
+    try:
+        for line in CONFIG_PATH.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, _, value = line.partition("=")
+            if key.strip() == "show_osd":
+                return value.strip().lower() in ("1", "true", "yes", "on")
+    except OSError:
+        pass
+    return True
 
 
 def lux_to_pct(lux):
@@ -82,6 +108,8 @@ def set_pct(pct):
     # the user manager's PATH. Unguarded, its absence raises FileNotFoundError
     # out of here and kills the daemon on the first adjustment -- which looks
     # like "auto-brightness works for a few seconds after login, then stops".
+    if not show_osd_enabled():
+        return
     try:
         subprocess.Popen(
             ["omarchy-osd", "-i", "brightness", "-p", str(pct)],

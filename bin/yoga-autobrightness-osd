@@ -1,0 +1,48 @@
+#!/bin/bash
+
+# Turn the on-screen slider for automatic brightness changes on or off.
+# The daemon re-reads the setting on each adjustment, so this takes effect
+# immediately without restarting anything.
+
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/yoga-autobrightness.conf"
+
+current() {
+  grep -E '^\s*show_osd\s*=' "$CONF" 2>/dev/null | tail -1 |
+    sed -E 's/.*=\s*//' | tr -d '[:space:]' | tr 'A-Z' 'a-z'
+}
+
+write() {
+  mkdir -p "$(dirname "$CONF")"
+  if [[ -f $CONF ]] && grep -qE '^\s*show_osd\s*=' "$CONF"; then
+    sed -i -E "s/^\s*show_osd\s*=.*/show_osd = $1/" "$CONF"
+  else
+    printf 'show_osd = %s\n' "$1" >> "$CONF"
+  fi
+}
+
+case "${1:-toggle}" in
+on)  write true  ;;
+off) write false ;;
+toggle)
+  case "$(current)" in
+  false | 0 | no | off) write true ;;
+  *) write false ;;
+  esac
+  ;;
+status)
+  case "$(current)" in
+  false | 0 | no | off) echo "off" ;;
+  *) echo "on" ;;
+  esac
+  exit 0
+  ;;
+*)
+  echo "usage: ${0##*/} [on|off|toggle|status]" >&2
+  exit 1
+  ;;
+esac
+
+state=$(case "$(current)" in false|0|no|off) echo off;; *) echo on;; esac)
+command -v omarchy-notification-send >/dev/null &&
+  omarchy-notification-send -u low "Brightness OSD: $state"
+echo "brightness OSD: $state"

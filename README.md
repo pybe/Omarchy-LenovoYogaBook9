@@ -258,6 +258,8 @@ Not a quirk — a feature the hardware supports and nothing ships to use. Requir
 sudo pacman -S --needed iio-sensor-proxy python-gobject
 sudo systemctl enable --now iio-sensor-proxy
 install -Dm755 bin/yoga-autobrightness ~/.local/bin/yoga-autobrightness
+install -Dm755 bin/yoga-autobrightness-osd ~/.local/bin/yoga-autobrightness-osd
+install -Dm644 config/yoga-autobrightness.conf ~/.config/yoga-autobrightness.conf
 install -Dm644 config/systemd/yoga-autobrightness.service \
   ~/.config/systemd/user/yoga-autobrightness.service
 systemctl --user daemon-reload && systemctl --user enable --now yoga-autobrightness
@@ -298,6 +300,15 @@ That reads as a dead sensor. It is not — nothing is holding the claim. The dae
 
 `stdbuf -oL` does not change this and a pty via `script` was no better. Whatever the mechanism, a shell read loop cannot be driven from it — hence D-Bus directly.
 
+The slider can be turned off without touching the service:
+
+```bash
+yoga-autobrightness-osd          # toggle
+yoga-autobrightness-osd off      # or: on, status
+```
+
+That writes `show_osd` to `~/.config/yoga-autobrightness.conf`, which the daemon re-reads on every adjustment — so it applies immediately rather than needing a restart. It defaults to on, because a brightness change with no visible cause reads as a glitch.
+
 **`brightnessctl` does not raise the OSD.** It writes sysfs directly; Omarchy's on-screen slider comes from `omarchy-osd`, which the brightness keybindings call explicitly. Without it an automatic change is invisible and looks like a glitch, so the daemon calls `omarchy-osd -i brightness -p <pct>` after adjusting — inside a `try`, since `omarchy-osd` resolves only because `/usr/share/omarchy/bin` is on the user manager's PATH, and an unguarded `Popen` would kill the daemon on its first adjustment.
 
 ---
@@ -334,6 +345,8 @@ sudo install -Dm644 config/libinput/local-overrides.quirks \
 sudo pacman -S --needed iio-sensor-proxy python-gobject
 sudo systemctl enable --now iio-sensor-proxy
 install -Dm755 bin/yoga-autobrightness ~/.local/bin/yoga-autobrightness
+install -Dm755 bin/yoga-autobrightness-osd ~/.local/bin/yoga-autobrightness-osd
+install -Dm644 config/yoga-autobrightness.conf ~/.config/yoga-autobrightness.conf
 install -Dm644 config/systemd/yoga-autobrightness.service \
   ~/.config/systemd/user/yoga-autobrightness.service
 systemctl --user daemon-reload
