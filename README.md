@@ -243,6 +243,15 @@ There is no escape hatch. aquamarine exposes `AQ_DRM_DEVICES`, `AQ_FORCE_LINEAR_
 
 Tried on this machine and backed out. An unusable pointer on the main panel is worse than a cosmetic boot logo, especially since the passphrase prompt needs a USB keyboard regardless.
 
+**Relocating the prompt to the lower panel is not configurable either.** plymouth's whole config surface is `Theme`, `ThemeDir`, `ShowDelay`, `DeviceScale` and `DeviceTimeout` — there is no output or connector selection. However, its DRM renderer groups connectors into "heads" and clones those whose modes match:
+
+```
+Adding connector with id %d to %dx%d head
+connector %u uses same controller as %u and modes differ, unlinking controller
+```
+
+Both panels here are identical (2880x1800@60), so the prompt is likely already mirrored onto `eDP-2` the right way up, making "read the bottom screen" the practical workaround at zero config cost. Inferred from the plugin's strings, not yet confirmed by observation on this machine. Forcing the upper connector off at boot with `video=eDP-1:d` would probably also leave it dark in the desktop, so it is not a sensible trade.
+
 For reference, if you want to experiment: Omarchy boots limine with a UKI, so the command line is assembled from `/etc/default/limine` plus `/etc/limine-entry-tool.d/*.conf`. Add a drop-in there and run `limine-mkinitcpio`; editing `/boot/limine.conf` directly is pointless because it is regenerated. Confirm what actually reached the UKI with:
 
 ```bash
