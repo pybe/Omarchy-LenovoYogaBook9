@@ -329,6 +329,8 @@ yoga-mode cycle        # step through them
 
 `book-flip` exists because which way you rotate the machine depends on where your cables are, and the two directions are not interchangeable.
 
+All of it is also on the Omarchy menu — [`config/omarchy/omarchy-menu.jsonc`](config/omarchy/omarchy-menu.jsonc) adds a **Display mode** entry listing the four modes with the active one ticked, plus toggles for auto-rotate and the brightness popup. Install to `~/.config/omarchy/extensions/omarchy-menu.jsonc` and run `omarchy menu refresh`.
+
 `present` mirrors the lower panel onto the upper one and sets the upper panel to `transform = 0` — upside down to you, correct way up to whoever you are showing it to. Hyprland does apply a transform to a mirroring output, so this works.
 
 ### Things that will catch you out

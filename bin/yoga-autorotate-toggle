@@ -1,0 +1,25 @@
+#!/bin/bash
+
+# Turn automatic display-mode switching on or off.
+#
+# Drives the systemd user service rather than a config flag, so "off" really
+# means not running rather than running-but-idle. Menu entries call this with
+# no argument to toggle, and with "status" to decide whether to show a tick.
+
+UNIT=yoga-autorotate.service
+
+state() { systemctl --user is-active --quiet "$UNIT" && echo on || echo off; }
+
+case "${1:-toggle}" in
+on)     systemctl --user enable --now "$UNIT" >/dev/null 2>&1 ;;
+off)    systemctl --user disable --now "$UNIT" >/dev/null 2>&1 ;;
+toggle) [ "$(state)" = on ] && "$0" off || "$0" on ;;
+status) state; exit 0 ;;
+*)      echo "usage: ${0##*/} [on|off|toggle|status]" >&2; exit 1 ;;
+esac
+
+sleep 1
+now=$(state)
+command -v omarchy-notification-send >/dev/null &&
+  omarchy-notification-send -u low "Auto-rotate: $now"
+echo "auto-rotate: $now"

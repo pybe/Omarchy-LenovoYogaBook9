@@ -21,8 +21,17 @@ MODE="2880x1800@60"
 
 apply() { hyprctl eval "$1" >/dev/null 2>&1; }
 
+# Moving one panel and then the other leaves a moment where both occupy the
+# same space, and Hyprland raises its on-screen config error banner for it --
+# briefly, but visibly, on every switch. Park the lower panel far away first so
+# the two never overlap at any point in the sequence.
+park() {
+  apply "hl.monitor({ output = \"eDP-2\", mode = \"$MODE\", position = \"10000x0\", scale = 2, transform = 0, mirror = \"none\" })"
+}
+
 # Stand / laptop: stacked landscape, upper above lower. The everyday layout.
 mode_stand() {
+  park
   apply "hl.monitor({ output = \"eDP-1\", mode = \"$MODE\", position = \"0x0\",   scale = 2, transform = 2, mirror = \"none\" })"
   apply "hl.monitor({ output = \"eDP-2\", mode = \"$MODE\", position = \"0x900\", scale = 2, transform = 0, mirror = \"none\" })"
 }
@@ -30,6 +39,7 @@ mode_stand() {
 # Book: machine turned 90 degrees, two portrait screens side by side.
 # 900x1440 logical each once rotated, so the right-hand panel starts at x=900.
 mode_book() {
+  park
   apply "hl.monitor({ output = \"eDP-2\", mode = \"$MODE\", position = \"0x0\",   scale = 2, transform = 1, mirror = \"none\" })"
   apply "hl.monitor({ output = \"eDP-1\", mode = \"$MODE\", position = \"900x0\", scale = 2, transform = 3, mirror = \"none\" })"
 }
@@ -38,6 +48,7 @@ mode_book() {
 # ports and cables are, so both are provided. Every panel gains 180 degrees
 # relative to mode_book, and the two swap sides.
 mode_book_flip() {
+  park
   apply "hl.monitor({ output = \"eDP-1\", mode = \"$MODE\", position = \"0x0\",   scale = 2, transform = 1, mirror = \"none\" })"
   apply "hl.monitor({ output = \"eDP-2\", mode = \"$MODE\", position = \"900x0\", scale = 2, transform = 3, mirror = \"none\" })"
 }
@@ -45,8 +56,12 @@ mode_book_flip() {
 # Present: mirrored, upper panel facing the person opposite. The upper panel
 # drops to transform 0 -- upside down to you, correct way up to them.
 mode_present() {
+  park
   apply "hl.monitor({ output = \"eDP-2\", mode = \"$MODE\", position = \"0x0\", scale = 2, transform = 0 })"
-  apply "hl.monitor({ output = \"eDP-1\", mode = \"$MODE\", position = \"0x0\", scale = 2, transform = 0, mirror = \"eDP-2\" })"
+  # A mirroring output ignores its position visually, but Hyprland still counts
+  # it in the layout -- placing it at 0x0 alongside eDP-2 raises "Monitor eDP-1
+  # overlaps with other monitor(s)". Park it clear of eDP-2 instead.
+  apply "hl.monitor({ output = \"eDP-1\", mode = \"$MODE\", position = \"0x900\", scale = 2, transform = 0, mirror = \"eDP-2\" })"
 }
 
 current() { cat "$MODE_FILE" 2>/dev/null || echo stand; }

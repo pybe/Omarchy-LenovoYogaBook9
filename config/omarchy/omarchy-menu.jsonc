@@ -1,0 +1,74 @@
+{
+  // Extend the Quickshell Omarchy menu with JSONC.
+  //
+  // IDs are object keys. The parent is inferred from the dotted id, so
+  // "personal.notes" appears under "personal", and "personal" appears on the
+  // root menu. Reuse an existing id to override/extend it.
+  //
+  // Fields:
+  //   icon        Nerd Font glyph shown in the icon column.
+  //   label       Visible row title.
+  //   action      Shell command to run. If omitted, the row is a submenu.
+  //   target      Existing submenu id to open. Use for links/aliases.
+  //   provider    Runtime provider function/command returning JSON rows.
+  //   aliases     alternate `omarchy menu summon <name>` routes; also searchable.
+  //   description Optional subtitle and extra search text.
+  //   when        Shell condition; hide row when it fails.
+  //   checked     Shell condition; append ✓ when it succeeds.
+  //
+  // Examples:
+  // "personal": {"icon":"","label":"Personal"},
+  // "personal.notes": {"icon":"󰎞","label":"Notes","action":"omarchy-launch-editor ~/notes"},
+  // "personal.files": {"icon":"","label":"Files","action":"uwsm-app -- nautilus ~/Documents"},
+  //
+  // Only use provider when a provider_name function or command named "name"
+  // returns JSON rows. Static submenus only need dotted ids.
+  //
+  // Example: replace the default About action by reusing the same id. Existing
+  // fields are kept unless overridden.
+  // "about": {"icon":"","label":"About","action":"omarchy-launch-or-focus-tui \"zsh -c 'fastfetch; read -k 1'\""},
+
+  // ---- Yoga Book 9 display modes -------------------------------------------
+  // `checked` ticks whichever mode is active; yoga-mode records it in
+  // $XDG_RUNTIME_DIR/yoga-mode.
+  "display": {"icon":"\udb80\udf79","label":"Display mode","description":"Stand, book, or present layout for the two panels"},
+
+  "display.stand": {
+    "icon":"\udb80\udf22","label":"Stand",
+    "description":"Stacked landscape - the everyday layout",
+    "action":"yoga-mode stand",
+    "checked":"[ \"$(yoga-mode status)\" = stand ]"
+  },
+  "display.book": {
+    "icon":"\udb81\udcba","label":"Book",
+    "description":"Turned 90 degrees - two portrait screens",
+    "action":"yoga-mode book",
+    "checked":"[ \"$(yoga-mode status)\" = book ]"
+  },
+  "display.bookflip": {
+    "icon":"\udb81\udcba","label":"Book (other way)",
+    "description":"Book mode rotated the opposite direction",
+    "action":"yoga-mode book-flip",
+    "checked":"[ \"$(yoga-mode status)\" = book-flip ]"
+  },
+  "display.present": {
+    "icon":"\udb84\udc89","label":"Present",
+    "description":"Mirrored, upper panel facing the person opposite",
+    "action":"yoga-mode present",
+    "checked":"[ \"$(yoga-mode status)\" = present ]"
+  },
+
+  "display.autorotate": {
+    "icon":"\udb80\udc68","label":"Auto-rotate",
+    "description":"Switch between stand and book automatically from the accelerometer",
+    "action":"yoga-autorotate-toggle",
+    "checked":"yoga-autorotate-toggle status | grep -q on"
+  },
+  "display.osd": {
+    "icon":"\udb80\udd33","label":"Brightness popup",
+    "description":"Show the slider when brightness adjusts automatically",
+    "action":"yoga-autobrightness-osd",
+    "checked":"yoga-autobrightness-osd status | grep -q on"
+  }
+
+}
