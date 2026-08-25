@@ -209,6 +209,26 @@ wpctl inspect @DEFAULT_AUDIO_SINK@ | grep audio.channels    # expect 4
 
 Bass returns immediately. Pure userspace, no kernel patch, survives kernel updates.
 
+### The amp has a tuning profile for this exact machine
+
+The speakers are Bowers & Wilkins branded, and that voicing lives in the amplifier's regbin firmware rather than anywhere in userspace. There is a file for this machine specifically:
+
+```
+/lib/firmware/ti/audio/tas2781/TAS2XXX3881.bin.zst
+                              ^^^^
+codec subsystem ID: 0x17aa3881
+```
+
+**Do not leave `Speaker Force Firmware Load` switched on.** It is useful for testing — with calibration failing it was the only way to get the DSP profiles to appear at all — but forcing the load plausibly makes the driver use a generic profile instead of resolving the machine-specific file. Worse, **ALSA saves mixer state at shutdown and restores it**, so a control set once as an experiment silently persists across every subsequent reboot:
+
+```bash
+amixer -c 0 cget numid=3          # Speaker Force Firmware Load
+amixer -c 0 cset numid=3 off
+sudo alsactl store                # or it comes back
+```
+
+Whether this changes the sound is **untested** — the driver loads firmware only at init, so it needs a reboot to evaluate.
+
 ### Tone correction on top
 
 Feeding the woofers fixes the missing bass, but these are small drivers in a thin chassis and still sound light. [`config/pipewire/60-bass-boost.conf`](config/pipewire/60-bass-boost.conf) adds a fixed low shelf and a small upper-mid trim using PipeWire's **built-in** biquad filters — no plugins, no application running, loaded at startup:
