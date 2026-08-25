@@ -568,7 +568,11 @@ Still genuinely missing: the `SEN3` thermal sensor is unreadable.
 
 ### Not investigated
 
-- The virtual keyboard / trackpad overlay on the lower panel. Note the firmware presents its own `...-emulated-touchpad` device, so this is likely handled below the OS.
+- **The virtual keyboard and trackpad do not work on Linux, and cannot without new software.** On Windows they are provided by Lenovo's *Yoga Book 9 User Center*, which watches the lower touchscreen for gestures — an 8-finger tap raises the virtual touchpad, a 3-finger tap the virtual keyboard — then switches that screen into input mode and draws the graphics. That application is Windows-only.
+
+  The firmware does present the input devices regardless (`...-emulated-touchpad` and `...-keyboard` on the INGENIC USB gadget), which makes it look as though the feature is available. Nothing on Linux listens for the gestures, switches the mode, or renders anything, so those devices stay dormant. The `BTN_RIGHT` quirk above is therefore currently theoretical: it fixes a device that never activates.
+
+  Anyone wanting a touch keyboard on the lower panel today would use a general Wayland on-screen keyboard (`wvkbd`, `squeekboard`) positioned there — not Lenovo's.
 - Sleep/resume behaviour of the second panel's backlight.
 
 ## Confirmed working — don't go looking for problems here
