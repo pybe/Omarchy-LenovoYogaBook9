@@ -1,0 +1,10 @@
+# Lenovo Yoga Book 9 13IRU8 (82YQ)
+
+[Yoga Book 9 Emulated Touchpad]
+MatchName=*Emulated Touchpad*
+MatchUdevType=touchpad
+# The firmware declares this a clickpad while also advertising a physical
+# right button, which libinput reports as a kernel bug and which makes
+# right-click unreliable. Removing the bogus button leaves clickfinger
+# behaviour to provide right-click.
+AttrEventCodeDisable=BTN_RIGHT

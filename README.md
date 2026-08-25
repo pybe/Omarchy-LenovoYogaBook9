@@ -410,16 +410,30 @@ That three-angle hinge sensor is the obvious signal for auto-switching display m
 
 `fwupd` isn't installed. BIOS is `KXCN41WW`, dated 2024-12-19. Given how much of this machine's behaviour is firmware-driven, worth having.
 
-### No battery charge threshold
+### Battery charge limiting — available, but not where you would look
 
-ACPI can't resolve the embedded-controller charge object, and no `charge_control_*` attributes appear under `/sys/class/power_supply/BAT*/`:
+ACPI cannot resolve the embedded-controller charge object, and there are **no** `charge_control_*` attributes under `/sys/class/power_supply/BAT*/`:
 
 ```
 ACPI Error: AE_NOT_FOUND, While resolving a named reference package element - \_SB_.PC00.LPCB.H_EC.CHRG
 ACPI Error: AE_NOT_FOUND, While resolving a named reference package element - \_SB_.PC00.LPCB.H_EC.SEN3
 ```
 
-So charge limiting isn't available, and one thermal sensor (`SEN3`) is unreadable.
+That makes it look unsupported. It is not — `ideapad_laptop` exposes Lenovo's conservation mode on the platform device instead:
+
+```bash
+$ ls /sys/bus/platform/devices/VPC2004:00/
+camera_power  conservation_mode  fan_mode  platform-profile  usb_charging  ...
+
+$ cat /sys/bus/platform/devices/VPC2004:00/conservation_mode
+0
+```
+
+Writing `1` caps charging (Lenovo's implementation stops around 55-60%) to preserve battery health. It is a toggle, not an arbitrary threshold.
+
+`usb_charging`, `fan_mode` and `camera_power` are exposed on the same device.
+
+Still genuinely missing: the `SEN3` thermal sensor is unreadable.
 
 ### Not investigated
 
