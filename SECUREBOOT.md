@@ -1,6 +1,6 @@
 # Secure Boot and TPM unlock
 
-**Status: in progress.** Keys are created and every boot binary is signed. Firmware key enrolment and Secure Boot itself are not done yet. Nothing here changes how the machine boots today — signed binaries boot normally with Secure Boot disabled.
+**Status: keys enrolled, Secure Boot not yet switched on.** Everything is signed and the firmware holds our keys plus Microsoft's. The remaining step is enabling Secure Boot in the BIOS.
 
 ## Why bother
 
@@ -50,11 +50,43 @@ sbctl verify        # all green
 zz-sbctl.hook
 ```
 
+## Signing breaks limine's hash pinning — sign first, then rewrite hashes
+
+This is the trap on an Omarchy/limine system, and it bites immediately.
+
+`limine.conf` pins each bootable file by blake2b checksum, appended to the path with `#`:
+
+```
+path: boot():/EFI/Linux/omarchy_linux.efi#71af4420bf12602e6442aab2a6be9773...
+hash_mismatch_panic: no
+```
+
+Signing appends a signature, which changes the file, which invalidates that hash. The next boot throws **"blake2b hash for uri does not match"**. It is a warning rather than a dead machine only because Omarchy ships `hash_mismatch_panic: no` — do not assume that is true on another setup.
+
+The fix is ordering: sign, then regenerate the config so the recorded hashes describe the signed files.
+
+```bash
+limine-update      # rewrite limine.conf
+sbctl sign-all     # re-sign anything that lost its signature
+limine-update      # rewrite again, now describing the signed files
+sbctl verify
+```
+
+Confirm rather than assume, since the failure mode is a boot-time error:
+
+```bash
+recorded=$(grep -m1 'omarchy_linux.efi#' /boot/limine.conf | sed 's/.*#//')
+actual=$(b2sum /boot/EFI/Linux/omarchy_linux.efi | cut -d' ' -f1)
+[ "$recorded" = "$actual" ] && echo MATCH || echo MISMATCH
+```
+
+**`limine-update` re-deploys `/boot/EFI/BOOT/BOOTX64.EFI` unsigned.** Running it strips that file's signature, so sign it again afterwards and check with `sbctl verify`. Package upgrades are unaffected — `zz-sbctl.hook` sorts after limine's `80-limine-efi-deploy.hook` — but a manual `limine-update` leaves the bootloader unsigned until you re-sign it. That would be a failure to boot once Secure Boot is on.
+
 ## Remaining steps
 
-1. **BIOS:** F2 at boot (or the Novo pinhole). Security → Secure Boot → clear/erase keys, often worded "Reset to Setup Mode". Leave Secure Boot **off**. Save, exit, boot normally. `sbctl status` should then report `Setup Mode: Enabled`.
-2. **Enrol:** `sbctl enroll-keys -m`. The `-m` keeps Microsoft's vendor keys, which matters on a Lenovo — firmware capsule updates and option ROMs are signed with them, and dropping them can break firmware updates.
-3. **BIOS again:** enable Secure Boot. Confirm with `bootctl status` (`Secure Boot: enabled`) or `sbctl status`.
+1. ~~**BIOS:** clear/erase keys to reach Setup Mode, leaving Secure Boot off.~~ **Done.** On this Insyde firmware the option sits under Security → Secure Boot. `sbctl status` then reported `Setup Mode: Enabled`, `Vendor Keys: none`.
+2. ~~**Enrol:** `sbctl enroll-keys -m`.~~ **Done.** The `-m` keeps Microsoft's vendor keys, which matters on a Lenovo — firmware capsule updates and option ROMs are signed with them, and dropping them can break firmware updates. Status afterwards: `Setup Mode: Disabled`, `Vendor Keys: microsoft`.
+3. **BIOS again:** enable Secure Boot. Confirm with `bootctl status` (`Secure Boot: enabled`) or `sbctl status`. **← next**
 4. **TPM:** then, and only then, enrol the TPM for LUKS. That needs the initramfs switched from the `encrypt` hook to `sd-encrypt`, the `cryptdevice=` parameter replaced with `rd.luks.*`, and `systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7`. PCR 7 is the Secure Boot state, which is the whole point of doing it in this order. Keep the passphrase keyslot as a fallback.
 
 Keep a USB keyboard attached throughout: firmware setup and the LUKS prompt both need one.
