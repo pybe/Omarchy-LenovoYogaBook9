@@ -251,6 +251,39 @@ wpctl set-default $(pw-dump | jq -r '.[]|select(.info.props."node.name"?=="bass_
 
 Edit the `Gain` values and restart PipeWire to taste. Keep it modest — large boosts on small drivers give distortion, not depth.
 
+### Speaker correction from Lenovo's own driver
+
+The speakers are Bowers & Wilkins branded and the correction curve for them exists — in Lenovo's Windows driver package, not on Linux. It is extractable.
+
+`ksya020f7q9edme0.exe` is an Inno Setup wrapper; `innoextract` yields, among 859 files:
+
+```
+Dolby/ext_lenovo_AIO_rtk/DEV_0287_SUBSYS_17AA3881_PCI_SUBSYS_384317AA.xml
+```
+
+Matching this machine on all three IDs — `DEV_0287` (ALC287), `SUBSYS_17AA3881` (codec), `PCI_SUBSYS_384317AA` (PCI SSID). 550 KB of Dolby Atmos tuning, including a parametric EQ **per physical position** — `laptop`, `stand`, `tent`, `tablet`, `normal` — which map onto the modes `yoga-mode` implements.
+
+```
+stand    high-shelf 1600 Hz  +5.00 dB  S=1.0
+         peaking    2500 Hz  -5.00 dB  Q=1.5
+         peaking    1500 Hz  +6.00 dB  Q=3.5
+         peaking     500 Hz  +3.00 dB  Q=0.5
+```
+
+Filter types are evidenced rather than assumed: `type=1` carries `q` in all 340 instances in the file, `type=3` carries `s` in all 90 and appears only at 1500-1600 Hz. Dolby's shelf slope converts by `1/Q² = (A + 1/A)(1/S − 1) + 2`, so `S=1 → Q=0.7071`. Types 7 and 9 sit at 285-300 Hz, matching `sliding-bass-xo-frequency=300` — they are that crossover.
+
+**Two findings matter more than the EQ itself.**
+
+The endpoint is `total_count="2" has_subwoofer="0"` — **Windows sends plain stereo**. No upmix, no separate woofer channel; the amp crosses over internally. The 4-channel workaround above exists only because Linux cannot reach the woofers through the codec at all.
+
+And `sliding-bass` is enabled: **up to 18.625 dB of gain below 300 Hz, applied more as level falls**. That, not the EQ, is why Windows holds together quietly. Everything else bass-related is off — `bass-enhancer`, `bass-extraction`, `virtual-bass` all `0`.
+
+There is no gain compensation anywhere (`pregain=0`, `postgain=0`, `system-gain=0`) despite filter gains reaching +9 dB. Dolby relies on `regulator-enable=1`, a limiter with speaker-distortion modelling, to absorb it. Copy the EQ without headroom and it clips.
+
+[`config/pipewire/62-yoga-dolby-eq.conf`](config/pipewire/62-yoga-dolby-eq.conf) implements this, with `yoga-volume` setting the bass shelf as the volume changes. See issue #9 for the full analysis.
+
+> **The XML is proprietary Lenovo/Dolby data.** Extracted for interoperability on the machine it shipped with. Derived filter values are recorded; the file itself is not redistributed and must not be committed.
+
 ### If you want a graphical equaliser
 
 **Use [`jamesdsp`](https://aur.archlinux.org/packages/jamesdsp) (AUR).** It is a port of the Android app: a slider bank, a bass control, named presets. It works the way an equaliser on a phone, TV or car stereo works, which is what most people actually want.
