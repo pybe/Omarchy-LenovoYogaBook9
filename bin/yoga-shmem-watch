@@ -1,0 +1,463 @@
+#!/usr/bin/env python3
+"""Record who is holding shared memory, before an OOM makes it unknowable.
+
+On 2026-08-27 this machine spent three hours with every byte of RAM and all
+30 GB of swap consumed, and nothing recorded where it went. The kernel's OOM
+dump was unambiguous that no process was responsible:
+
+    all 128 processes, RSS + swap    2.2 GB
+    actually committed               ~45 GB
+    shmem                            13.5 GB
+
+The gap is shared memory nobody has mapped. A `memfd_create` region is charged
+to no process's RSS, appears under no tmpfs in `df`, and is invisible to cgroup
+accounting -- so the OOM dump, `ps`, and systemd-oomd all report a machine
+using almost nothing, right up until an allocation fails. Chromium's browser
+process took the failure and aborted; the kernel then killed two more processes
+over the following hour, and eventually the compositor, which took the session
+down with it.
+
+None of that evidence survives the event. The holder is identifiable only while
+it is still running, so this records it at the time.
+
+Four places shared memory hides, all cheap to read, none in the OOM dump:
+
+  fds       An open fd to a memfd or tmpfs file, never mapped. This is the
+            case that went unexplained on 2026-08-27, and the only one
+            genuinely invisible everywhere else.
+  mapped    RssShmem from /proc/PID/status -- shmem a process has mapped in.
+  GPU       i915 buffer objects, allocated from a kernel-internal shmem mount
+            that belongs to no fd and no mapping, counted in Shmem all the
+            same. ~900 MiB of the idle baseline on this machine is this.
+  tmpfs     Files on /tmp, /dev/shm and /run that no process holds open.
+
+The measurement that matters for the first is `st_blocks`, not `st_size`:
+
+    ftruncate(fd, 256 MiB)   -> st_size 256 MiB, st_blocks 0
+    write 64 MiB into it     -> st_size 256 MiB, st_blocks 64 MiB
+
+st_size is the region's nominal extent and says nothing about memory; st_blocks
+is the pages actually allocated, including those pushed out to swap. Summing
+st_blocks over every shmem-backed fd, deduplicated by inode because a buffer
+passed over Wayland is open in both client and compositor, gives the number the
+OOM dump cannot.
+
+This runs unprivileged, so it sees the user's own processes -- which is the
+whole graphical session -- but not other users' daemons. Snapshots say so
+rather than implying the accounting is complete.
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+MEMINFO = Path("/proc/meminfo")
+STATE_DIR = Path(
+    os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")
+) / "yoga-shmem-watch"
+LOG = STATE_DIR / "shmem-watch.log"
+CONFIG = Path(
+    os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")
+) / "yoga-shmem-watch.conf"
+
+POLL_SECONDS = 5
+TRIGGER_GIB = 4.0        # idle here is ~1 GiB; 4 is clear of normal variation
+REARM_GROWTH_GIB = 1.0   # re-snapshot once it has grown this much again
+MAX_SNAPSHOTS = 12       # per episode, so a slow leak cannot fill the disk
+LOG_MAX_BYTES = 4 * 1024 * 1024
+
+# Prefixes whose backing store is shmem. memfd has no mount point and shows up
+# only by this link name; the rest are the tmpfs mounts a desktop session uses.
+SHMEM_PREFIXES = ("/memfd:", "/dev/shm/", "/tmp/", "/run/")
+
+MIB = 1024 ** 2
+GIB = 1024 ** 3
+
+
+def load_config():
+    """Override the module defaults from a simple key=value file."""
+    global TRIGGER_GIB, POLL_SECONDS, REARM_GROWTH_GIB
+    try:
+        text = CONFIG.read_text()
+    except OSError:
+        return
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        try:
+            match key.strip():
+                case "trigger_gib":
+                    TRIGGER_GIB = float(value)
+                case "poll_seconds":
+                    POLL_SECONDS = int(value)
+                case "rearm_growth_gib":
+                    REARM_GROWTH_GIB = float(value)
+        except ValueError:
+            pass
+
+
+def size(n):
+    """Adaptive units. A leak is interesting long before it reaches a GiB."""
+    if n >= GIB:
+        return f"{n / GIB:7.2f} GiB"
+    if n >= MIB:
+        return f"{n / MIB:7.1f} MiB"
+    return f"{n / 1024:7.0f} KiB"
+
+
+def meminfo():
+    """Parse /proc/meminfo into a dict of kB values."""
+    out = {}
+    for line in MEMINFO.read_text().splitlines():
+        key, _, rest = line.partition(":")
+        parts = rest.split()
+        if parts:
+            try:
+                out[key] = int(parts[0])
+            except ValueError:
+                pass
+    return out
+
+
+def read_first_line(path, default="?"):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return default
+
+
+def process_slice(pid):
+    """The cgroup leaf, which says whether oomd was even allowed to act."""
+    path = read_first_line(f"/proc/{pid}/cgroup", "").rpartition(":")[2]
+    parts = [p for p in path.split("/")
+             if p.endswith((".slice", ".scope", ".service"))]
+    return "/".join(parts[-2:]) if parts else (path or "?")
+
+
+def pids():
+    for entry in Path("/proc").iterdir():
+        if entry.name.isdigit():
+            yield int(entry.name)
+
+
+def scan_fds():
+    """Shmem-backed fds: the kind nothing else can see.
+
+    Returns (per_process, per_label, total) with total deduplicated by inode,
+    so a buffer open in both client and compositor is counted once.
+    """
+    per_process = {}
+    per_label = {}
+    seen = set()
+    total = 0
+
+    for pid in pids():
+        try:
+            fds = list((Path("/proc") / str(pid) / "fd").iterdir())
+        except OSError:
+            continue  # not ours, or exited between listing and opening
+
+        mine = 0
+        for fd in fds:
+            try:
+                target = os.readlink(fd)
+            except OSError:
+                continue
+            if not target.startswith(SHMEM_PREFIXES):
+                continue
+            try:
+                st = os.stat(fd)  # follows the link to the open file
+            except OSError:
+                continue
+
+            nbytes = st.st_blocks * 512
+            if not nbytes:
+                continue
+            mine += nbytes
+
+            key = (st.st_dev, st.st_ino)
+            if key in seen:
+                continue
+            seen.add(key)
+            total += nbytes
+
+            label = target.removesuffix(" (deleted)")
+            if label.startswith("/memfd:"):
+                label = "memfd:" + label[len("/memfd:"):]
+            else:
+                label = str(Path(label).parent)  # group tmpfs files by directory
+            per_label[label] = per_label.get(label, 0) + nbytes
+
+        if mine:
+            per_process[pid] = mine
+
+    return per_process, per_label, total
+
+
+def scan_mapped():
+    """Shmem mapped into processes, straight from RssShmem in status."""
+    per_process = {}
+    total = 0
+    for pid in pids():
+        try:
+            text = (Path("/proc") / str(pid) / "status").read_text()
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if line.startswith("RssShmem:"):
+                nbytes = int(line.split()[1]) * 1024
+                if nbytes:
+                    per_process[pid] = nbytes
+                    total += nbytes
+                break
+    return per_process, total
+
+
+def scan_gpu():
+    """i915 buffer objects, per DRM client.
+
+    These live in a kernel-internal shmem mount belonging to no fd and no
+    mapping, yet count in Shmem -- so without this a snapshot shows a large
+    unexplained remainder. Key names are driver-specific: i915 reports
+    drm-resident-system0 rather than the generic drm-resident-memory.
+    """
+    per_process = {}
+    total = 0
+    seen = set()
+
+    for pid in pids():
+        fdinfo_dir = Path("/proc") / str(pid) / "fdinfo"
+        try:
+            entries = list(fdinfo_dir.iterdir())
+        except OSError:
+            continue
+
+        mine = 0
+        for entry in entries:
+            try:
+                text = entry.read_text()
+            except OSError:
+                continue
+            if "drm-driver:" not in text:
+                continue
+
+            client, resident = None, 0
+            for line in text.splitlines():
+                key, _, value = line.partition(":")
+                value = value.strip()
+                if key == "drm-client-id":
+                    client = value
+                elif key.startswith("drm-resident-"):
+                    resident += parse_drm_size(value)
+
+            if not resident or client is None or client in seen:
+                continue
+            seen.add(client)
+            mine += resident
+            total += resident
+
+        if mine:
+            per_process[pid] = mine
+
+    return per_process, total
+
+
+def parse_drm_size(value):
+    """DRM fdinfo sizes come as '0', '104 MiB' or '351224 KiB'."""
+    parts = value.split()
+    if not parts:
+        return 0
+    try:
+        n = float(parts[0])
+    except ValueError:
+        return 0
+    unit = parts[1] if len(parts) > 1 else "KiB"
+    return int(n * {"KiB": 1024, "MiB": MIB, "GiB": GIB}.get(unit, 1024))
+
+
+def tmpfs_usage():
+    """Per-mount tmpfs usage, covering files no process holds open."""
+    rows = []
+    try:
+        mounts = Path("/proc/self/mountinfo").read_text().splitlines()
+    except OSError:
+        return rows
+    for line in mounts:
+        fields = line.split(" - ")
+        if len(fields) < 2 or not fields[1].startswith("tmpfs "):
+            continue
+        point = fields[0].split()[4]
+        try:
+            st = os.statvfs(point)
+        except OSError:
+            continue
+        used = (st.f_blocks - st.f_bfree) * st.f_frsize
+        if used:
+            rows.append((point, used, st.f_blocks * st.f_frsize))
+    return sorted(rows, key=lambda r: -r[1])
+
+
+def describe(pid):
+    return read_first_line(f"/proc/{pid}/comm"), process_slice(pid)
+
+
+def holders_table(per_process, limit=12):
+    lines = []
+    for pid, nbytes in sorted(per_process.items(), key=lambda kv: -kv[1])[:limit]:
+        name, slice_ = describe(pid)
+        lines.append(f"  {size(nbytes)}  {pid:>7}  {name:<18} {slice_}")
+    return lines or ["  (none)"]
+
+
+def write_snapshot(stamp, mem, reason):
+    fd_procs, fd_labels, fd_total = scan_fds()
+    map_procs, map_total = scan_mapped()
+    gpu_procs, gpu_total = scan_gpu()
+    tmpfs = tmpfs_usage()
+    tmpfs_total = sum(used for _, used, _ in tmpfs)
+
+    shmem = mem.get("Shmem", 0) * 1024
+
+    out = [
+        "",
+        "=" * 74,
+        f"{stamp}  {reason}",
+        "=" * 74,
+        f"  Shmem          {size(shmem)}",
+        f"  MemAvailable   {size(mem.get('MemAvailable', 0) * 1024)}"
+        f"  of {size(mem.get('MemTotal', 0) * 1024)}",
+        f"  SwapFree       {size(mem.get('SwapFree', 0) * 1024)}"
+        f"  of {size(mem.get('SwapTotal', 0) * 1024)}",
+        "",
+        "  where it is:",
+        f"    held by fds, unmapped  {size(fd_total)}   <- invisible to the OOM dump",
+        f"    mapped into processes  {size(map_total)}",
+        f"    GPU objects (i915)     {size(gpu_total)}",
+        f"    tmpfs mounts           {size(tmpfs_total)}",
+        "  These do not sum to Shmem and are not meant to: a mapped memfd",
+        "  counts in the first two, and a buffer shared between a client and",
+        "  the compositor is counted against both, so the GPU line can exceed",
+        "  Shmem on its own. Read them as 'which of these is growing, and in",
+        "  which process', not as a partition. Only same-uid processes are",
+        "  visible; other users' daemons are not.",
+        "",
+        "-- shmem held by fds, largest first " + "-" * 38,
+        f"  {'SIZE':>11}  {'PID':>7}  {'PROCESS':<18} CGROUP",
+    ]
+    out += holders_table(fd_procs)
+
+    out += ["", "-- by region name " + "-" * 55]
+    ranked_labels = sorted(fd_labels.items(), key=lambda kv: -kv[1])[:12]
+    out += [f"  {size(n)}  {label}" for label, n in ranked_labels] or ["  (none)"]
+
+    out += ["", "-- shmem mapped into processes " + "-" * 43,
+            f"  {'SIZE':>11}  {'PID':>7}  {'PROCESS':<18} CGROUP"]
+    out += holders_table(map_procs)
+
+    out += ["", "-- GPU buffer objects " + "-" * 52,
+            f"  {'SIZE':>11}  {'PID':>7}  {'PROCESS':<18} CGROUP"]
+    out += holders_table(gpu_procs)
+
+    out += ["", "-- tmpfs mounts " + "-" * 58]
+    out += [f"  {size(used)}  of {size(cap):>11}  {point}"
+            for point, used, cap in tmpfs] or ["  (none)"]
+    out.append("")
+
+    text = "\n".join(out) + "\n"
+    try:
+        if LOG.exists() and LOG.stat().st_size > LOG_MAX_BYTES:
+            LOG.replace(LOG.with_name(LOG.name + ".1"))
+        with LOG.open("a") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+    except OSError as exc:
+        print(f"yoga-shmem-watch: cannot write {LOG}: {exc}", file=sys.stderr)
+
+    ranked = sorted(fd_procs.items(), key=lambda kv: -kv[1])
+    return text, ranked
+
+
+def notify(shmem, ranked):
+    """Tell the user while the session is still alive to show it."""
+    if not shutil.which("notify-send"):
+        return
+    if ranked:
+        pid, nbytes = ranked[0]
+        name, _ = describe(pid)
+        detail = f"Largest fd holder: {name} ({size(nbytes).strip()})"
+    else:
+        detail = "No process holds it by fd; see the snapshot."
+    try:
+        subprocess.run(
+            ["notify-send", "-u", "critical", "-a", "yoga-shmem-watch",
+             f"Shared memory at {shmem / GIB:.1f} GiB",
+             f"{detail}\nSnapshot: {LOG}"],
+            check=False, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def main():
+    load_config()
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+    if "--once" in sys.argv:
+        text, _ = write_snapshot(
+            time.strftime("%Y-%m-%d %H:%M:%S"), meminfo(),
+            "manual snapshot (--once)",
+        )
+        print(text, end="")
+        return 0
+
+    trigger = TRIGGER_GIB * GIB
+    rearm = REARM_GROWTH_GIB * GIB
+    armed = True          # False while an episode is in progress
+    snapshots = 0
+    next_at = trigger
+
+    while True:
+        try:
+            mem = meminfo()
+        except OSError:
+            time.sleep(POLL_SECONDS)
+            continue
+
+        shmem = mem.get("Shmem", 0) * 1024
+
+        if shmem >= next_at and snapshots < MAX_SNAPSHOTS:
+            reason = (f"Shmem crossed {next_at / GIB:.1f} GiB" if armed
+                      else f"Shmem grew past {next_at / GIB:.1f} GiB")
+            _, ranked = write_snapshot(
+                time.strftime("%Y-%m-%d %H:%M:%S"), mem, reason)
+            if armed:
+                notify(shmem, ranked)
+                armed = False
+            snapshots += 1
+            next_at = shmem + rearm
+
+        elif shmem < trigger * 0.75 and not armed:
+            armed = True          # episode over, re-arm for the next
+            snapshots = 0
+            next_at = trigger
+            try:
+                with LOG.open("a") as fh:
+                    fh.write(f"\n{time.strftime('%Y-%m-%d %H:%M:%S')}"
+                             f"  recovered, Shmem back to {shmem / GIB:.2f} GiB\n")
+            except OSError:
+                pass
+
+        time.sleep(POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(0)

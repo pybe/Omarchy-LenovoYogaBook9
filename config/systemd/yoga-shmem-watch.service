@@ -1,0 +1,47 @@
+[Unit]
+Description=Snapshot shared-memory holders before an OOM makes them unknowable
+After=graphical-session.target
+PartOf=graphical-session.target
+
+# StartLimit* must live in [Unit]: systemd moved them there in v229 and
+# silently ignores them in [Service] ("Unknown key ... ignoring"). Without
+# them, Restart=always with RestartSec=5 never trips the default limit, so a
+# permanently broken daemon loops forever as "activating (auto-restart)" and
+# never reaches "failed" where anyone would notice.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/yoga-shmem-watch
+Restart=always
+RestartSec=5
+
+# background.slice, not the app.slice a user unit would land in by default.
+# /usr/lib/systemd/user/app.slice.d/10-oomd.conf makes app.slice the only
+# thing systemd-oomd may kill, and this exists precisely to survive the
+# pressure long enough to record what caused it. It costs ~7 MB and no swap,
+# so oomd would never rank it above a browser -- but a watcher that can be
+# killed by the event it is watching is not worth having.
+Slice=background.slice
+
+# StateDirectory creates the log directory under ~/.local/state.
+StateDirectory=yoga-shmem-watch
+NoNewPrivileges=true
+
+# Deliberately NOT sandboxed with ProtectSystem= or ProtectHome=. Both create
+# a mount namespace, and the new /proc instance inside it hides other
+# processes' fdinfo -- which is the entire input this reads. Measured, with
+# one process counting the /proc entries it can open:
+#
+#   (none)                    fd 61   fdinfo 61
+#   ProtectSystem=strict      fd 63   fdinfo  0
+#   ProtectHome=read-only     fd 63   fdinfo  0
+#   NoNewPrivileges=true      fd 63   fdinfo 63
+#
+# The failure is silent: the service starts, logs snapshots on schedule, and
+# reports every holder as 0 bytes. It was caught only by triggering it against
+# a deliberate 3.2 GiB allocation and noticing the snapshot could not see it.
+
+[Install]
+WantedBy=graphical-session.target

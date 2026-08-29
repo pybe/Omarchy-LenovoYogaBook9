@@ -517,6 +517,63 @@ JamesDSP has its own limiter (`master_limthreshold`, `master_limrelease` in `~/.
 
 ---
 
+## Recording shared memory before an OOM hides it
+
+On 2026-08-27 this machine spent three hours with all 15 GB of RAM and all 30 GB of swap consumed. Chromium's browser process aborted, the kernel killed two more processes over the following hour, and eventually took the compositor and the whole session with it. Nothing recorded where the memory went, and the kernel's own OOM dump was actively misleading about it:
+
+```
+all 128 processes, RSS + swap    2.2 GB
+actually committed               ~45 GB
+shmem                            13.5 GB
+```
+
+The gap is shared memory nobody has mapped. A `memfd_create` region is charged to no process's RSS, sits under no tmpfs in `df`, and is invisible to cgroup accounting — so `ps`, the OOM dump, and systemd-oomd all report a machine using almost nothing, right up until an allocation fails. systemd-oomd never fired, and structurally could not have helped: everything in `app.slice`, the only thing Omarchy permits it to kill, held about 2 GB of the missing 43.
+
+That evidence exists only while the holder is still running. `yoga-shmem-watch` polls `/proc/meminfo` and, when `Shmem` crosses a threshold, writes a snapshot naming who holds it — to `~/.local/state/yoga-shmem-watch/shmem-watch.log`, and a desktop notification while the session is still alive to show one.
+
+The measurement that matters is `st_blocks`, not `st_size`:
+
+```
+ftruncate(fd, 256 MiB)   ->  st_size 256 MiB,  st_blocks 0
+write 64 MiB into it     ->  st_size 256 MiB,  st_blocks 64 MiB
+```
+
+`st_size` is the region's nominal extent and says nothing about memory. `st_blocks` is the pages actually allocated, including those pushed out to swap.
+
+It reports four places shared memory hides, none of which appear in an OOM dump:
+
+| Source | Read from | Idle here |
+|---|---|---|
+| fds, unmapped | `st_blocks` of every shmem fd, deduplicated by inode | ~4 MiB |
+| mapped | `RssShmem` in `/proc/PID/status` | ~1 MiB |
+| GPU objects | `drm-resident-*` in DRM `fdinfo` | ~1.2 GiB |
+| tmpfs | `statvfs` per mount | ~14 MiB |
+
+The GPU line is most of the idle baseline, which is why it is measured rather than left in an unexplained remainder. Note the driver-specific key names: i915 reports `drm-resident-system0`, not the generic `drm-resident-memory`, so a grep for the latter silently finds nothing.
+
+Sanity-check it any time without waiting for an incident:
+
+```bash
+yoga-shmem-watch --once
+```
+
+Two limits, both stated in every snapshot rather than left implicit. The categories overlap and are not a partition of `Shmem` — a mapped memfd counts in the first two, and a buffer shared between a client and the compositor is counted against both, so the GPU line alone can exceed `Shmem`. And it runs unprivileged: the whole graphical session is visible, other users' daemons are not.
+
+**Do not add `ProtectSystem=` or `ProtectHome=` to the unit.** Both create a mount namespace whose `/proc` hides other processes' `fdinfo`, which is the entire input this reads:
+
+```
+(none)                    fd 61   fdinfo 61
+ProtectSystem=strict      fd 63   fdinfo  0
+ProtectHome=read-only     fd 63   fdinfo  0
+NoNewPrivileges=true      fd 63   fdinfo 63
+```
+
+The failure is silent — the service starts, logs snapshots on schedule, and reports every holder as 0 bytes. It was caught only by triggering it against a deliberate 3.2 GiB allocation and noticing the snapshot could not see it.
+
+The unit also runs in `background.slice` rather than the `app.slice` a user service lands in by default, so the one thing oomd is allowed to kill is not the watcher.
+
+---
+
 ## Applying all of it
 
 ```bash
@@ -561,9 +618,16 @@ install -Dm644 config/omarchy/omarchy-menu.jsonc \
 install -Dm644 config/yoga-autobrightness.conf ~/.config/yoga-autobrightness.conf
 install -Dm644 config/systemd/yoga-autobrightness.service \
   ~/.config/systemd/user/yoga-autobrightness.service
+
+# Shared-memory watcher (no dependencies beyond python3)
+install -Dm755 bin/yoga-shmem-watch ~/.local/bin/yoga-shmem-watch
+install -Dm644 config/systemd/yoga-shmem-watch.service \
+  ~/.config/systemd/user/yoga-shmem-watch.service
+
 systemctl --user daemon-reload
 systemctl --user enable --now yoga-autobrightness
 systemctl --user enable --now yoga-autorotate
+systemctl --user enable --now yoga-shmem-watch
 omarchy menu refresh
 ```
 
