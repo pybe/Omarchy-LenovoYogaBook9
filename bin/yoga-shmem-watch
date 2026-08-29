@@ -384,9 +384,17 @@ def write_snapshot(stamp, mem, reason):
 
 
 def notify(shmem, ranked):
-    """Tell the user while the session is still alive to show it."""
+    """Tell the user while the session is still alive to show it.
+
+    Critical urgency on purpose: during a real episode this is the warning
+    before the session dies, and it should not quietly expire. That makes
+    clearing it on recovery this function's responsibility rather than the
+    user's -- hence --print-id, so the recovery path can replace this exact
+    notification instead of leaving a permanent popup quoting numbers that
+    stopped being true. Returns the id, or None if it could not be sent.
+    """
     if not shutil.which("notify-send"):
-        return
+        return None
     if ranked:
         pid, nbytes = ranked[0]
         name, _ = describe(pid)
@@ -394,10 +402,28 @@ def notify(shmem, ranked):
     else:
         detail = "No process holds it by fd; see the snapshot."
     try:
-        subprocess.run(
-            ["notify-send", "-u", "critical", "-a", "yoga-shmem-watch",
+        done = subprocess.run(
+            ["notify-send", "--print-id", "-u", "critical",
+             "-a", "yoga-shmem-watch",
              f"Shared memory at {shmem / GIB:.1f} GiB",
              f"{detail}\nSnapshot: {LOG}"],
+            check=False, timeout=5, capture_output=True, text=True,
+        )
+        return int(done.stdout.strip())
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def notify_recovered(notify_id, shmem):
+    """Replace the warning with a self-expiring note that it is over."""
+    if notify_id is None or not shutil.which("notify-send"):
+        return
+    try:
+        subprocess.run(
+            ["notify-send", "--replace-id", str(notify_id),
+             "-u", "normal", "-t", "8000", "-a", "yoga-shmem-watch",
+             "Shared memory back to normal",
+             f"Now {shmem / GIB:.1f} GiB. Snapshot kept: {LOG}"],
             check=False, timeout=5,
         )
     except (OSError, subprocess.SubprocessError):
@@ -421,6 +447,7 @@ def main():
     armed = True          # False while an episode is in progress
     snapshots = 0
     next_at = trigger
+    notify_id = None      # the warning to replace once it recovers
 
     while True:
         try:
@@ -437,7 +464,7 @@ def main():
             _, ranked = write_snapshot(
                 time.strftime("%Y-%m-%d %H:%M:%S"), mem, reason)
             if armed:
-                notify(shmem, ranked)
+                notify_id = notify(shmem, ranked)
                 armed = False
             snapshots += 1
             next_at = shmem + rearm
@@ -446,6 +473,8 @@ def main():
             armed = True          # episode over, re-arm for the next
             snapshots = 0
             next_at = trigger
+            notify_recovered(notify_id, shmem)
+            notify_id = None
             try:
                 with LOG.open("a") as fh:
                     fh.write(f"\n{time.strftime('%Y-%m-%d %H:%M:%S')}"
