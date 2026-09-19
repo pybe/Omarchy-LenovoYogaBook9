@@ -1,0 +1,11 @@
+{
+  "pointerSpeed": 2.4,
+  "pointerAccel": 0.1,
+  "scrollSpeed": 0.9,
+  "inertiaStrength": 1.5,
+  "inertiaDuration": 650.0,
+  "predictionEnabled": false,
+  "autocorrectEnabled": true,
+  "inertiaEnabled": true,
+  "oledTheme": false
+}

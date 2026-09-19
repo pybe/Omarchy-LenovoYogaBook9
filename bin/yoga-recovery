@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""Local snapshots and explicit recovery of Yoga desktop customization."""
+import argparse
+from datetime import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+HOME=Path.home()
+BACKUPS=HOME/'.local/state/yoga-book/backups'
+PATTERNS=(
+    '.config/hypr/*.lua', '.config/yoga-panel/settings.json',
+    '.config/voxtype/config.toml', '.config/systemd/user/yoga-*.service',
+    '.config/systemd/user/voxtype.service', '.config/systemd/user/voxtype.service.d/*.conf', '.local/bin/yoga-*',
+    '.config/wireplumber/wireplumber.conf.d/*yoga*',
+    '.config/pipewire/pipewire.conf.d/*yoga*',
+    '.config/omarchy/extensions/omarchy-menu.jsonc',
+    '.config/omarchy/shell.json', '.config/omarchy/plugins/*/*',
+    '.config/omarchy/hooks/post-update.d/*yoga*',
+    '.local/share/applications/*yoga*.desktop',
+    '.local/share/yoga-panel/**/*',
+)
+
+def digest(path): return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def files():
+    result={}
+    for pattern in PATTERNS:
+        for path in HOME.glob(pattern):
+            relative=path.relative_to(HOME)
+            if path.is_file() and not any(p in ('build','__pycache__','.git') for p in relative.parts):
+                result[str(relative)]=path
+    return result
+
+def snapshot():
+    BACKUPS.mkdir(parents=True,exist_ok=True,mode=0o700)
+    target=BACKUPS/datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+    target.mkdir(mode=0o700)
+    manifest={}
+    for relative,source in files().items():
+        dest=target/'home'/relative
+        dest.parent.mkdir(parents=True,exist_ok=True)
+        shutil.copy2(source,dest)
+        manifest[relative]=digest(dest)
+    (target/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2)+'\n')
+    units=subprocess.run(['systemctl','--user','list-unit-files','--state=enabled','--no-legend','--no-pager','yoga-*.service','voxtype.service'],capture_output=True,text=True,check=True)
+    (target/'enabled-units.json').write_text(json.dumps([line.split()[0] for line in units.stdout.splitlines() if line.split()])+ '\n')
+    # System-owned customization is recorded, never automatically installed as root.
+    service=Path('/etc/systemd/system/yoga-sensor-keepalive.service')
+    if service.is_file():shutil.copy2(service,target/'system-sensor-keepalive.reference')
+    print(target)
+    return target
+
+def validate(target):
+    manifest=json.loads((target/'manifest.json').read_text())
+    if not isinstance(manifest,dict) or not manifest: raise ValueError('Empty or invalid snapshot')
+    for relative,sha in manifest.items():
+        path=Path(relative)
+        if path.is_absolute() or '..' in path.parts or not path.parts or path.parts[0] not in ('.config','.local'):
+            raise ValueError('Invalid snapshot path')
+        source=target/'home'/relative
+        if not source.is_file() or source.is_symlink() or digest(source)!=sha:
+            raise ValueError('Snapshot checksum mismatch: '+relative)
+    return manifest
+
+def restore(target):
+    manifest=validate(target)
+    print('Saving current files before recovery:')
+    before=snapshot()
+    subprocess.run(['systemctl','--user','stop','yoga-panel.service'],check=True)
+    build=HOME/'.local/share/yoga-panel/build'
+    subprocess.run(['hyprctl','plugin','unload',str(build/'yoga-panel-gesture.so')],check=False)
+    if build.exists():shutil.move(str(build),str(before/'native-build'))
+    for relative in manifest:
+        destination=HOME/relative
+        destination.parent.mkdir(parents=True,exist_ok=True)
+        temporary=destination.with_name(destination.name+'.yoga-restore.tmp')
+        shutil.copy2(target/'home'/relative,temporary)
+        os.replace(temporary,destination)
+    subprocess.run(['systemctl','--user','daemon-reload'],check=True)
+    units=json.loads((target/'enabled-units.json').read_text())
+    allowed={'yoga-panel.service','yoga-brightness-sync.service','yoga-autobrightness.service','yoga-autorotate.service','yoga-shmem-watch.service','voxtype.service'}
+    units=[unit for unit in units if unit in allowed]
+    if units:
+        subprocess.run(['systemctl','--user','enable',*units],check=True)
+        subprocess.run(['systemctl','--user','restart',*units],check=True)
+    subprocess.run(['hyprctl','reload'],check=True)
+    errors=subprocess.run(['hyprctl','configerrors'],capture_output=True,text=True,check=True)
+    if errors.stdout.strip():raise RuntimeError('Hyprland config errors after recovery: '+errors.stdout.strip())
+    print('User files restored. Original pre-recovery files remain in the snapshot above.')
+
+def check():
+    failures=[]
+    for unit in ('yoga-panel.service','yoga-brightness-sync.service','voxtype.service'):
+        for state in ('is-enabled','is-active'):
+            result=subprocess.run(['systemctl','--user',state,unit],capture_output=True,text=True)
+            if result.returncode:failures.append(unit+': '+result.stdout.strip())
+    for name in ('yoga-keyboard','yoga-pointer'):
+        path=HOME/'.local/share/yoga-panel/build'/name
+        if not path.is_file():failures.append('Missing '+name);continue
+        result=subprocess.run(['ldd',str(path)],capture_output=True,text=True)
+        if result.returncode or 'not found' in result.stdout+result.stderr:failures.append('Rebuild needed: '+name)
+    result=subprocess.run(['hyprctl','plugin','list','-j'],capture_output=True,text=True)
+    if result.returncode or not any(p.get('name')=='yoga-panel-gesture' for p in json.loads(result.stdout or '[]')):
+        failures.append('Yoga touch plugin is not loaded')
+    result=subprocess.run(['hyprctl','configerrors'],capture_output=True,text=True)
+    if result.returncode or result.stdout.strip():failures.append('Hyprland configuration: '+(result.stdout+result.stderr).strip())
+    if failures:
+        print('\n'.join(failures),file=sys.stderr)
+        print('After a system update, log out and back in so the panel can rebuild against the new Hyprland. Backups: '+str(BACKUPS),file=sys.stderr)
+        return 1
+    print('OK: panel, brightness sync, dictation, input libraries and touch plugin')
+    return 0
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action',choices=('snapshot','list','verify','restore','check'))
+    parser.add_argument('path',nargs='?',type=Path)
+    args=parser.parse_args()
+    if args.action=='snapshot':snapshot()
+    elif args.action=='list':
+        if BACKUPS.exists():
+            for p in sorted(BACKUPS.iterdir()):
+                if (p/'manifest.json').is_file():print(p)
+    elif args.action=='check':return check()
+    else:
+        if args.path is None:parser.error('Snapshot directory is required')
+        if args.action=='restore':restore(args.path.resolve())
+        else:print('Verified files:',len(validate(args.path.resolve())))
+    return 0
+if __name__=='__main__':
+    try:sys.exit(main())
+    except (OSError,ValueError,RuntimeError,subprocess.SubprocessError) as e:
+        print('Yoga recovery: '+str(e),file=sys.stderr);sys.exit(1)

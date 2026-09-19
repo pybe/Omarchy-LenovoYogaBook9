@@ -1,0 +1,11 @@
+singleton Theme 1.0 Theme.qml
+Key 1.0 Key.qml
+LetterKey 1.0 LetterKey.qml
+MicKey 1.0 MicKey.qml
+Overview 1.0 Overview.qml
+PanelSettings 1.0 PanelSettings.qml
+PreferenceRow 1.0 PreferenceRow.qml
+ScrollPreference 1.0 ScrollPreference.qml
+SettingsCard 1.0 SettingsCard.qml
+SettingsSlider 1.0 SettingsSlider.qml
+SettingsSwitch 1.0 SettingsSwitch.qml

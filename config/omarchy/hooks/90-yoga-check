@@ -1,0 +1,11 @@
+#!/bin/bash
+# Post-update: preserve the result and report failures without resetting user choices.
+set -u
+state="$HOME/.local/state/yoga-book"
+mkdir -p "$state"
+failed=0
+"$HOME/.local/bin/yoga-recovery" snapshot >> "$state/post-update.log" 2>&1 || failed=1
+"$HOME/.local/bin/yoga-recovery" check >> "$state/post-update.log" 2>&1 || failed=1
+if (( failed )); then
+  command -v notify-send >/dev/null && notify-send 'Yoga Book' 'The panel needs attention after the update. Log out and back in; report: ~/.local/state/yoga-book/post-update.log'
+fi

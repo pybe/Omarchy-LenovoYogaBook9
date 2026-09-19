@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+"""Mirror the primary panel's backlight after changes from any desktop UI."""
+from pathlib import Path
+import subprocess
+import time
+
+def target_level(primary, secondary):
+    level = int((primary/'brightness').read_text())
+    maximum = int((primary/'max_brightness').read_text())
+    other_maximum = int((secondary/'max_brightness').read_text())
+    return round(level*other_maximum/maximum)
+
+def main():
+    backlights = Path('/sys/class/backlight')
+    primary = backlights/'intel_backlight'
+    failed = False
+    while True:
+        try:
+            # DRM card numbering may change with kernel updates.
+            secondary = next(backlights.glob('*-eDP-2-backlight'))
+            target = target_level(primary,secondary)
+            if int((secondary/'brightness').read_text()) != target:
+                subprocess.run(['brightnessctl','-q','-d',secondary.name,'set',str(target)],check=True,timeout=5)
+            failed = False
+        except (OSError, ValueError, StopIteration, ZeroDivisionError, subprocess.SubprocessError) as error:
+            if not failed:
+                print(f'Waiting for accessible Yoga backlights: {error}',flush=True)
+            failed = True
+        time.sleep(0.3 if not failed else 2)
+
+if __name__ == '__main__':
+    main()

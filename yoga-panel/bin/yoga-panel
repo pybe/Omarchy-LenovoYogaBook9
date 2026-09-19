@@ -1,0 +1,26 @@
+#!/bin/bash
+set -euo pipefail
+config="$HOME/.local/share/yoga-panel"
+action=${1:-toggle}
+case "$action" in
+  stop)
+    systemctl --user stop yoga-panel.service
+    hyprctl plugin unload "$config/build/yoga-panel-gesture.so" || true
+    exit ;;
+  show|hide|toggle) ;;
+  gesture)
+    # From the touchscreen plugin: previous|next|minimize|restore|overview.
+    [[ ${2:-} =~ ^(previous|next|minimize|restore|overview)$ ]] || { echo 'Usage: yoga-panel gesture previous|next|minimize|restore|overview' >&2; exit 2; } ;;
+  *) echo 'Usage: yoga-panel [show|hide|toggle|stop|gesture NAME]' >&2; exit 2 ;;
+esac
+systemctl --user start yoga-panel.service
+for attempt in {1..30}; do
+  if quickshell ipc -p "$config" call panel status >/dev/null 2>&1; then
+    [[ $action == show ]] && action=openPanel
+    [[ $action == gesture ]] && exec quickshell ipc -p "$config" call panel gesture "$2"
+    exec quickshell ipc -p "$config" call panel "$action"
+  fi
+  sleep 0.1
+done
+echo 'Panel IPC unavailable; see journalctl --user -u yoga-panel' >&2
+exit 1
