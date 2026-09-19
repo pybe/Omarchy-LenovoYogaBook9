@@ -1,0 +1,529 @@
+#!/usr/bin/env python3
+"""Fixed-model fan control for 82YQ / KXCN41WW / KXEC31WW, as a root service.
+
+Only SRAM fan overrides 0x5FA/0x5FB and PWM2 clock-selector bits 5:4 are
+writable. No firmware flash, PWM duty/period or thermal protection writes.
+Systemd owns watchdog/crash recovery; a root-only journal identifies our writes.
+
+Usage: yoga-fan [status|install|remove|curve|auto|max]
+"""
+
+import fcntl
+import json
+import math
+import mmap
+import os
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+from contextlib import ExitStack, contextmanager
+from pathlib import Path
+
+EC_BASE = 0xFE0B0000
+OUT = Path("/run/yoga-fan")
+RUNTIME = Path("/run/yoga-fan-control")
+OWNED = RUNTIME / "owned"
+FAULT = RUNTIME / "fault"
+CONFIG = Path("/etc/yoga-fan.json")
+INSTALLED = Path("/usr/local/bin/yoga-fan")
+UNIT = Path("/etc/systemd/system/yoga-fan.service")
+SLEEP_HOOK = Path("/usr/lib/systemd/system-sleep/yoga-fan")
+# RPM targets, not direct PWM writes. Intermediate PWM percentages are approximate.
+DEFAULT_STEPS = [
+    [70, 4000, 6000],
+    [75, 4500, 7000],
+    [80, 5100, 8200],
+    [90, 5400, 8800],
+    [95, 6000, 10000],
+]
+MAX_TARGET = (60, 100)
+EXPECTED_PWM = {
+    0x1800: 0,
+    0x1801: 255,
+    0x180A: 0,
+    0x180B: 2,
+    0x180C: 0xC0,
+    0x180D: 0x55,
+    0x180E: 0,
+    0x180F: 0,
+    0x1810: 0,
+    0x1827: 1,
+    0x1828: 0,
+    0x1840: 16,
+    0x1841: 159,
+    0x1849: 0,
+}
+READ_REGISTERS = {*EXPECTED_PWM, 0x1804, 0x1808, 0x2000, 0x2001, 0x2002}
+SERVICE = """[Unit]
+Description=Yoga Book 9 temperature staircase and fan RPM
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/yoga-fan run
+ExecStopPost=/usr/local/bin/yoga-fan reset
+Restart=on-failure
+RestartSec=2
+WatchdogSec=5
+WatchdogSignal=SIGKILL
+TimeoutStartSec=10
+TimeoutStopSec=3
+RuntimeDirectory=yoga-fan-control
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+UMask=0022
+NoNewPrivileges=yes
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target
+"""
+HOOK = """#!/bin/sh
+# Stop and restore before sleep; only restart a previously running service.
+exec /usr/local/bin/yoga-fan sleep "$1"
+"""
+
+
+class Curve:
+    def __init__(self, steps):
+        if not isinstance(steps, list) or not 2 <= len(steps) <= 12:
+            raise ValueError("Expected 2..12 temperature steps")
+        previous = (0, 0, 0)
+        for row in steps:
+            if (
+                not isinstance(row, list)
+                or len(row) != 3
+                or any(type(v) is not int for v in row)
+            ):
+                raise ValueError("Steps must be integer [C, RPM1, RPM2] triples")
+            c, first, second = row
+            if not (
+                40 <= c <= 100
+                and previous[0] < c
+                and 1600 <= first <= 6000
+                and 1600 <= second <= 10000
+                and first >= previous[1]
+                and second >= previous[2]
+                and first % 100 == second % 100 == 0
+            ):
+                raise ValueError("Invalid or decreasing temperature/RPM step")
+            previous = row
+        if steps[-1][0] < 95:
+            raise ValueError("The final temperature step must start at 95..100 C")
+        if any(row[0] < 95 and (row[1] >= 6000 or row[2] >= 10000) for row in steps):
+            raise ValueError("Reserve full-speed targets for 95 C and above")
+        self.steps = steps
+        self.level = -1
+        self.below_since = None
+
+    def targets(self, temperature, now):
+        if not math.isfinite(temperature) or not 0 < temperature <= 110:
+            raise ValueError("Invalid CPU temperature")
+        desired = max(
+            (i for i, row in enumerate(self.steps) if temperature >= row[0]), default=-1
+        )
+        if desired > self.level:
+            self.level, self.below_since = desired, None
+        elif desired < self.level and temperature < self.steps[self.level][0] - 3:
+            if self.below_since is None:
+                self.below_since = now
+            if now - self.below_since >= 20:
+                self.level, self.below_since = desired, None
+        else:
+            self.below_since = None
+        return (
+            tuple(v // 100 for v in self.steps[self.level][1:])
+            if self.level >= 0
+            else (0, 0)
+        )
+
+
+def atomic(path, text, mode=0o644):
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w") as stream:
+        stream.write(text)
+    tmp.chmod(mode)
+    tmp.replace(path)
+
+
+def config():
+    value = (
+        json.loads(CONFIG.read_text())
+        if CONFIG.exists()
+        else {"mode": "curve", "steps": DEFAULT_STEPS}
+    )
+    if not isinstance(value, dict) or value.get("mode") not in ("auto", "curve", "max"):
+        raise ValueError("Invalid fan mode")
+    Curve(value.get("steps"))
+    return value
+
+
+def output(fd, port, value):
+    if os.pwrite(fd, bytes((value,)), port) != 1:
+        raise OSError("Short port write")
+
+
+def read_register(fd, address):
+    if address not in READ_REGISTERS:
+        raise ValueError("Register outside fixed read allowlist")
+    for selector, value in ((0x11, address >> 8), (0x10, address & 255)):
+        output(fd, 0x4E, 0x2E)
+        output(fd, 0x4F, selector)
+        output(fd, 0x4E, 0x2F)
+        output(fd, 0x4F, value)
+    output(fd, 0x4E, 0x2E)
+    output(fd, 0x4F, 0x12)
+    output(fd, 0x4E, 0x2F)
+    return os.pread(fd, 1, 0x4F)[0]
+
+
+def model_check():
+    for name, expected in (("product_name", "82YQ"), ("bios_version", "KXCN41WW")):
+        if Path("/sys/class/dmi/id", name).read_text().strip() != expected:
+            raise RuntimeError("Unsupported laptop or BIOS; EC untouched")
+    if Path("/sys/firmware/dmi/entries/0-0/raw").read_bytes()[22:24] != bytes((1, 31)):
+        raise RuntimeError("Unsupported EC firmware; EC untouched")
+
+
+@contextmanager
+def hardware(write):
+    model_check()
+    with ExitStack() as stack:
+        port = None
+        if write:
+            lock = os.open(
+                "/run/lock/yoga-ec-fan-test.lock",
+                os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW,
+                0o600,
+            )
+            stack.callback(os.close, lock)
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            port = os.open("/dev/port", os.O_RDWR | os.O_CLOEXEC)
+            stack.callback(os.close, port)
+            for index, expected in ((0x20, 0x55), (0x21, 7)):
+                output(port, 0x4E, index)
+                if os.pread(port, 1, 0x4F) != bytes((expected,)):
+                    raise RuntimeError("Unexpected PNP controller")
+            if tuple(read_register(port, a) for a in (0x2000, 0x2001, 0x2002)) != (
+                0x55,
+                7,
+                2,
+            ):
+                raise RuntimeError("Unexpected ITE controller")
+        mem = os.open(
+            "/dev/mem", (os.O_RDWR if write else os.O_RDONLY) | os.O_SYNC | os.O_CLOEXEC
+        )
+        stack.callback(os.close, mem)
+        ec = stack.enter_context(
+            mmap.mmap(
+                mem,
+                4096,
+                prot=mmap.PROT_READ | (mmap.PROT_WRITE if write else 0),
+                offset=EC_BASE,
+            )
+        )
+        yield ec, port
+
+
+def clock(port, enabled):
+    current = read_register(port, 0x180C)
+    if (current & 0x30) not in (0, 0x10):
+        raise RuntimeError("PWM2 clock selector changed externally")
+    value = (current & ~0x30) | (0x10 if enabled else 0)
+    # read_register leaves exactly PCSSGL's DATA selected; other channels survive.
+    if value != current:
+        output(port, 0x4F, value)
+    if read_register(port, 0x180C) != value:
+        raise RuntimeError("PWM2 clock did not read back")
+
+
+def write_targets(ec, targets):
+    if len(targets) != 2 or any(
+        v != 0 and not 16 <= v <= MAX_TARGET[i] for i, v in enumerate(targets)
+    ):
+        raise ValueError("RPM target outside tested bounds")
+    for _ in range(3):
+        for i, value in enumerate(targets):
+            ec[0x5FA + i] = value
+        if ec[0x5FA:0x5FC] == bytes(targets):
+            return
+        time.sleep(0.05)
+    raise RuntimeError("Fan targets did not read back")
+
+
+def restore(ec, port):
+    if OWNED.exists():
+        try:
+            write_targets(ec, (0, 0))
+        finally:
+            clock(port, False)
+        OWNED.unlink()
+        print("Restored EC automatic targets and original PWM2 clock", flush=True)
+
+
+def cooling_floor(ec, targets):
+    if ec[0x400] != 0x10 or ec[0x4B0] & 1 or ec[0x344] & 2:
+        raise RuntimeError("EC power state or cooling policy changed")
+    automatic = tuple(ec[0x5A0:0x5A2])
+    if any(v and not 16 <= v <= MAX_TARGET[i] for i, v in enumerate(automatic)):
+        raise RuntimeError("Unknown automatic RPM target")
+    return tuple(max(v, automatic[i]) if v else 0 for i, v in enumerate(targets))
+
+
+def apply_targets(ec, port, targets):
+    if not any(targets):
+        restore(ec, port)
+        return
+    if not OWNED.exists():
+        if any(ec[0x5FA:0x5FC]):
+            raise RuntimeError("Another controller owns the fan overrides")
+        if any(read_register(port, a) != v for a, v in EXPECTED_PWM.items()):
+            raise RuntimeError("PWM configuration differs from the tested firmware")
+        # Journal before either write: ExecStopPost can recover even from SIGKILL.
+        atomic(OWNED, "KXEC31WW PCSSGL=C0 overrides=0,0\n", 0o600)
+        clock(port, True)
+    elif read_register(port, 0x180C) != 0xD0:
+        raise RuntimeError("PWM clock changed while controlling fans")
+    if ec[0x5FA:0x5FC] != bytes(targets):
+        write_targets(ec, targets)
+
+
+def notify(message):
+    address = os.environ.get("NOTIFY_SOCKET")
+    if address:
+        if address.startswith("@"):
+            address = "\0" + address[1:]
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as client:
+            client.sendto(message.encode(), address)
+
+
+def run():
+    RUNTIME.mkdir(mode=0o755, exist_ok=True)
+    try:
+        settings = config()
+    except (ValueError, OSError) as error:
+        atomic(FAULT, str(error))
+        settings = {"mode": "auto", "steps": DEFAULT_STEPS}
+    mode = "auto" if FAULT.exists() else settings["mode"]
+    control = mode != "auto"
+    if control and (
+        not os.environ.get("NOTIFY_SOCKET") or not os.environ.get("WATCHDOG_USEC")
+    ):
+        raise RuntimeError("EC control requires the systemd watchdog service")
+    if OWNED.exists():
+        raise RuntimeError("Pending rollback; refusing further control")
+    curve = Curve(settings["steps"])
+    hwmon = next(
+        p
+        for p in Path("/sys/class/hwmon").glob("*")
+        if (p / "name").read_text().strip() == "coretemp"
+    )
+    temps = list(hwmon.glob("temp*_input"))
+    if not temps or int((hwmon / "temp1_crit").read_text()) != 100000:
+        raise RuntimeError("Unknown CPU temperature sensor or critical limit")
+
+    def interrupted(_signum, _frame):
+        raise KeyboardInterrupt
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, interrupted)
+    with hardware(control) as (ec, port):
+        expected = (0, 0)
+        low_since: list[float | None] = [None, None]
+        previous = time.clock_gettime(time.CLOCK_BOOTTIME)
+        publish_at = 0
+        try:
+            while True:
+                now = time.clock_gettime(time.CLOCK_BOOTTIME)
+                if control and now - previous > 4:
+                    raise RuntimeError("Sampling gap; return cooling to the EC")
+                previous = now
+                temperature = max(int(p.read_text()) for p in temps) / 1000
+                requested = curve.targets(temperature, now)
+                rpm = struct.unpack_from("<HH", ec, 0x5A2)
+                if control:
+                    if tuple(ec[0x5FA:0x5FC]) != expected:
+                        raise RuntimeError("Fan override changed externally")
+                    targets = cooling_floor(
+                        ec, MAX_TARGET if mode == "max" else requested
+                    )
+                    for i, value in enumerate(rpm):
+                        if value > (6500, 10500)[i]:
+                            raise RuntimeError("Fan RPM above measurement sanity bound")
+                        low_since[i] = (
+                            (low_since[i] if low_since[i] is not None else now)
+                            if value < 1000 and targets[i]
+                            else None
+                        )
+                        since = low_since[i]
+                        if since is not None and now - since > 20:
+                            raise RuntimeError("Fan did not spin up within 20 s")
+                    apply_targets(ec, port, targets)
+                    expected = targets
+                else:
+                    targets = (0, 0)
+                if now >= publish_at:
+                    row = {
+                        "time": time.time(),
+                        "mode": mode,
+                        "temperature": temperature,
+                        "rpm": rpm,
+                        "target_rpm": [v * 100 for v in targets],
+                        "stock_target_rpm": [v * 100 for v in ec[0x5A0:0x5A2]],
+                        "step_c": curve.steps[curve.level][0]
+                        if mode == "curve" and curve.level >= 0
+                        else None,
+                        "pwm_percent": [
+                            round(read_register(port, a) / 159 * 100, 1)
+                            for a in (0x1804, 0x1808)
+                        ]
+                        if OWNED.exists()
+                        else None,
+                        "fault": FAULT.read_text().strip() if FAULT.exists() else None,
+                    }
+                    atomic(OUT, f"{rpm[0]} {rpm[1]}\n")
+                    atomic(RUNTIME / "status.json", json.dumps(row) + "\n")
+                    publish_at = now + 2
+                notify("READY=1\nWATCHDOG=1")
+                time.sleep(0.5 if control else 2)
+        finally:
+            if control:
+                restore(ec, port)
+
+
+def reset():
+    try:
+        if os.environ.get("SERVICE_RESULT", "success") != "success":
+            atomic(FAULT, "Service failure: " + os.environ["SERVICE_RESULT"])
+    finally:
+        # A full /run must not let fault reporting prevent hardware rollback.
+        if OWNED.exists():
+            with hardware(True) as (ec, port):
+                restore(ec, port)
+
+
+def systemctl(*args, check=True):
+    return subprocess.run(["systemctl", *args], check=check)
+
+
+def set_mode(mode):
+    systemctl("stop", "yoga-fan.service")
+    try:
+        settings = config()
+    except (ValueError, OSError):
+        if mode != "auto":
+            raise
+        settings = {"mode": "auto", "steps": DEFAULT_STEPS}
+    settings["mode"] = mode
+    atomic(CONFIG, json.dumps(settings, indent=2) + "\n")
+    FAULT.unlink(missing_ok=True)
+    systemctl("reset-failed", "yoga-fan.service", check=False)
+    systemctl("start", "yoga-fan.service")
+
+
+def sleep_hook(phase):
+    resume = RUNTIME / "resume"
+    if phase == "pre":
+        if (
+            systemctl(
+                "is-active", "--quiet", "yoga-fan.service", check=False
+            ).returncode
+            == 0
+        ):
+            atomic(resume, "1\n", 0o600)
+            systemctl("stop", "yoga-fan.service")
+    elif phase == "post" and resume.exists():
+        systemctl("start", "yoga-fan.service")
+        resume.unlink()
+
+
+def install():
+    model_check()
+    source = Path(__file__).resolve()
+    if source == INSTALLED:
+        raise RuntimeError("Install from the reviewed repository checkout")
+    settings = config()
+    backup = Path("/var/lib/yoga-fan/backups") / time.strftime("%Y%m%d-%H%M%S")
+    backup.mkdir(parents=True, mode=0o700)
+    for path in (INSTALLED, UNIT, CONFIG, SLEEP_HOOK):
+        if path.exists():
+            dest = backup / path.relative_to("/")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, dest)
+    if UNIT.exists():
+        systemctl("stop", "yoga-fan.service")
+    # A new installation enables the owner's curve; upgrades preserve their mode/table.
+    atomic(INSTALLED, source.read_text(), 0o755)
+    atomic(UNIT, SERVICE)
+    SLEEP_HOOK.parent.mkdir(parents=True, exist_ok=True)
+    atomic(SLEEP_HOOK, HOOK, 0o755)
+    atomic(CONFIG, json.dumps(settings, indent=2) + "\n")
+    systemctl("daemon-reload")
+    systemctl("enable", "yoga-fan.service")
+    systemctl("start", "yoga-fan.service")
+    print("Backup: " + str(backup))
+
+
+def main():
+    args = sys.argv[1:] or ["status"]
+    if args == ["status"]:
+        row = json.loads((RUNTIME / "status.json").read_text())
+        row["service_active"] = (
+            systemctl(
+                "is-active", "--quiet", "yoga-fan.service", check=False
+            ).returncode
+            == 0
+        )
+        row["stale"] = time.time() - row["time"] > 6
+        print(json.dumps(row, ensure_ascii=False, indent=2))
+        return
+    if args not in [
+        [a] for a in ("run", "reset", "install", "remove", "auto", "curve", "max")
+    ] + [["sleep", "pre"], ["sleep", "post"]]:
+        raise SystemExit(__doc__)
+    if os.geteuid() != 0:
+        if args[0] in ("run", "reset", "sleep"):
+            raise SystemExit("This entry point is reserved for the root service")
+        executable = Path(__file__).resolve() if args == ["install"] else INSTALLED
+        subprocess.run(
+            ["sudo" if sys.stdin.isatty() else "pkexec", str(executable), *args],
+            check=True,
+        )
+        return
+    if args[0] in ("auto", "curve", "max"):
+        set_mode(args[0])
+    elif args[0] == "sleep":
+        sleep_hook(args[1])
+    elif args == ["install"]:
+        install()
+    elif args == ["remove"]:
+        systemctl("disable", "--now", "yoga-fan.service")
+        reset()
+        for path in (INSTALLED, UNIT, SLEEP_HOOK, OUT):
+            path.unlink(missing_ok=True)
+        systemctl("daemon-reload")
+    elif args == ["reset"]:
+        reset()
+    else:
+        run()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    except (
+        OSError,
+        ValueError,
+        RuntimeError,
+        StopIteration,
+        subprocess.CalledProcessError,
+    ) as error:
+        print(f"yoga-fan: {error}", file=sys.stderr, flush=True)
+        raise SystemExit(1) from error
