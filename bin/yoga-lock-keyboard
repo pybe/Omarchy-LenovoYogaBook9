@@ -1,0 +1,44 @@
+#!/bin/bash
+# Put a touch keyboard on the lower panel of the Omarchy lock screen.
+#
+#   yoga-lock-keyboard install   copy TouchKeys.qml, patch LockView.qml, add a pacman hook,
+#                                make SDDM log back in after logout
+#   yoga-lock-keyboard apply     (re)patch only; the pacman hook runs this after omarchy upgrades
+#   yoga-lock-keyboard remove    undo the patch and drop the hook
+#   yoga-lock-keyboard check     show whether the patch is active
+#
+# The lock holds ext-session-lock, so Hyprland hides yoga-panel there; the keys
+# must live inside the lock surface. This edits a file owned by the omarchy
+# package, which is why a pacman hook re-applies it after every upgrade.
+# SDDM's own greeter has no touch keyboard, so logout goes straight back through
+# autologin, and Hyprland autostart locks the fresh session instead.
+set -euo pipefail
+LOCK=/usr/share/omarchy/shell/plugins/lock
+SRC=/usr/local/share/yoga-lock-keyboard/TouchKeys.qml
+HOOK=/etc/pacman.d/hooks/yoga-lock-keyboard.hook
+RELOGIN=/etc/sddm.conf.d/zz-yoga-relogin.conf
+REPO_QML=$(dirname "$(readlink -f "$0")")/../config/omarchy/lock/TouchKeys.qml
+
+priv() { if [[ $EUID -eq 0 ]]; then "$@"; elif [[ -t 0 ]]; then sudo "$@"; else pkexec "$@"; fi; }
+
+apply() {
+  install -Dm644 "$SRC" "$LOCK/TouchKeys.qml"
+  grep -q TouchKeys "$LOCK/LockView.qml" || sed -i '0,/^    BorderSurface {/s//    TouchKeys { view: root }\n\n&/' "$LOCK/LockView.qml"
+  # Upstream reshaping LockView.qml would silently leave no keys; say so in the pacman output.
+  grep -q TouchKeys "$LOCK/LockView.qml" || { echo "yoga-lock-keyboard: LockView.qml changed, patch not applied" >&2; exit 1; }
+}
+
+case "${1:-check}" in
+  install)
+    priv install -Dm644 "$REPO_QML" "$SRC"
+    priv install -Dm755 "$(readlink -f "$0")" /usr/local/bin/yoga-lock-keyboard
+    priv sh -c "mkdir -p /etc/pacman.d/hooks; printf '%s\n' '[Trigger]' 'Operation = Install' 'Operation = Upgrade' 'Type = Package' 'Target = omarchy' '' '[Action]' 'Description = Re-adding the Yoga Book touch keyboard to the lock screen...' 'When = PostTransaction' 'Exec = /usr/local/bin/yoga-lock-keyboard apply' > '$HOOK'"
+    priv sh -c "printf '%s\\n' '[Autologin]' 'Relogin=true' > '$RELOGIN'"
+    priv /usr/local/bin/yoga-lock-keyboard apply
+    ;;
+  apply) apply ;;
+  remove)
+    priv sh -c "sed -i '/^    TouchKeys { view: root }$/{N;d}' '$LOCK/LockView.qml'; rm -f '$LOCK/TouchKeys.qml' '$HOOK' '$RELOGIN' '$SRC' /usr/local/bin/yoga-lock-keyboard"
+    ;;
+esac
+grep -q TouchKeys "$LOCK/LockView.qml" && echo "lock screen: touch keyboard on eDP-2" || echo "lock screen: no touch keyboard"

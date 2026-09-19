@@ -592,6 +592,43 @@ The unit also runs in `background.slice` rather than the `app.slice` a user serv
 
 ---
 
+## The lock screen asks for a password nothing can type
+
+### What you see
+
+After suspend, hibernate or `omarchy system lock` the lock screen shows a password field. The machine has no built-in keyboard, and an on-screen keyboard started in the session never appears over it, so the only way back in is a Bluetooth or USB keyboard.
+
+### Why
+
+Omarchy's lock is a Quickshell `WlSessionLock` (`/usr/share/omarchy/shell/plugins/lock/`). While `ext-session-lock` is held, Hyprland renders and routes input to the lock surface only — any layer-shell keyboard is hidden by design. The keys have to live *inside* the lock surface.
+
+A user plugin cannot replace the lock: the shell only trusts first-party plugins with the `authentication` capability.
+
+### Fix
+
+[`config/omarchy/lock/TouchKeys.qml`](config/omarchy/lock/TouchKeys.qml) is a touch keyboard (letters, shift, digits/symbols, backspace, enter) drawn in the lock view on the lower panel `eDP-2` only. It edits the lock's own password text and submits through the same path as the Enter key, so PAM, faillock and fingerprint behave exactly as stock.
+
+[`bin/yoga-lock-keyboard`](bin/yoga-lock-keyboard) installs it (via `sudo` or `pkexec`):
+
+- copies the QML next to `LockView.qml` and inserts one `TouchKeys { view: root }` line;
+- adds `/etc/pacman.d/hooks/yoga-lock-keyboard.hook`, which re-applies the patch after every `omarchy` package upgrade and fails loudly if `LockView.qml` changed shape;
+- writes `/etc/sddm.conf.d/zz-yoga-relogin.conf` (`Relogin=true`), so logging out goes back through autologin instead of SDDM's greeter, which has no touch keyboard either.
+
+```bash
+bin/yoga-lock-keyboard install
+omarchy-restart-shell            # the running shell keeps the old QML
+bin/yoga-lock-keyboard check     # or: remove
+```
+
+With the TPM unlocking the disk ([SECUREBOOT.md](SECUREBOOT.md)) and SDDM autologin, boot itself asks for nothing. To require the password at boot too, lock right after login — guarded, so an upgrade that dropped the keys never strands a boot behind a prompt:
+
+```lua
+-- ~/.config/hypr/autostart.lua
+o.exec_on_start("grep -q TouchKeys /usr/share/omarchy/shell/plugins/lock/LockView.qml && omarchy-system-sleep-lock 12000")
+```
+
+`omarchy-system-sleep-lock` retries until the shell is up and the lock is secure, which a bare `omarchy-shell lock lock` at login would not.
+
 ## Applying all of it
 
 ```bash
