@@ -1,0 +1,12 @@
+[Unit]
+Description=Keep Yoga Book internal display brightness synchronized
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/python3 %h/.local/bin/yoga-brightness-sync
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

@@ -388,6 +388,26 @@ That writes `show_osd` to `~/.config/yoga-autobrightness.conf`, which the daemon
 
 ---
 
+## HDR on both panels
+
+### What you see
+
+Colours look flat and 8-bit. `hyprctl monitors -j` reports `"colorManagementPreset": "srgb"` and `"currentFormat": "XRGB8888"` on both panels.
+
+### Why
+
+Both OLED panels advertise HDR in their EDID — 10 bits per channel, BT2020, SMPTE ST2084 (PQ), ~617 cd/m² peak (`edid-decode /sys/class/drm/card1-eDP-1/edid`). Hyprland just does not turn it on by itself.
+
+### Fix
+
+[`config/hypr/monitors.lua`](config/hypr/monitors.lua) adds `bitdepth = 10, cm = "hdr"` to both monitor rules, and [`bin/yoga-mode`](bin/yoga-mode) carries the same keys, because `hl.monitor` replaces the whole rule and a mode switch would otherwise drop HDR.
+
+### Two traps
+
+**Brightness stops working.** In PQ mode the panel ignores the backlight: the content itself carries absolute luminance. The sysfs value still changes, so the keys, the OSD and auto-brightness all look alive while the screen stays put. [`bin/yoga-brightness-sync`](bin/yoga-brightness-sync) (a [user unit](config/systemd/user/yoga-brightness-sync.service), which also mirrors `intel_backlight` onto eDP-2) turns the backlight level into Hyprland's `sdrbrightness` on every HDR panel. 100% maps to `3.0`; retune with `hdr_max_sdrbrightness = 2.5` in `~/.config/yoga-autobrightness.conf`, read on every change. It rebuilds each rule from the live monitor state, so rotation and mirroring survive, and re-checks every 2 s to restore the value after `hyprctl reload` or a mode switch. With HDR off it only mirrors the backlight.
+
+**Terminals and dark themes look dim even at full brightness.** Hyprland decodes SDR windows with pure gamma 2.2, which crushes dark greys. `render.cm_sdr_eotf = "srgb"` in `monitors.lua` switches to the piecewise sRGB curve.
+
 ## Display modes
 
 This machine gets used in genuinely different physical arrangements, and one of them cannot be detected by any sensor. [`bin/yoga-mode`](bin/yoga-mode) switches between them:
@@ -641,6 +661,11 @@ install -Dm644 config/yoga-autobrightness.conf ~/.config/yoga-autobrightness.con
 install -Dm644 config/systemd/yoga-autobrightness.service \
   ~/.config/systemd/user/yoga-autobrightness.service
 
+# HDR brightness (after merging config/hypr/monitors.lua)
+install -Dm755 bin/yoga-brightness-sync ~/.local/bin/yoga-brightness-sync
+install -Dm644 config/systemd/user/yoga-brightness-sync.service \
+  ~/.config/systemd/user/yoga-brightness-sync.service
+
 # Shared-memory watcher (no dependencies beyond python3)
 install -Dm755 bin/yoga-shmem-watch ~/.local/bin/yoga-shmem-watch
 install -Dm644 config/systemd/yoga-shmem-watch.service \
@@ -650,6 +675,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now yoga-autobrightness
 systemctl --user enable --now yoga-autorotate
 systemctl --user enable --now yoga-shmem-watch
+systemctl --user enable --now yoga-brightness-sync
 omarchy menu refresh
 ```
 

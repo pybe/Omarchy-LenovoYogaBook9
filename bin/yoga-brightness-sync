@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Mirror the primary panel's backlight after changes from any desktop UI.
+
+In HDR mode the panels ignore the backlight: PQ content carries absolute
+luminance. There the same backlight level is turned into Hyprland's
+sdrbrightness, so the keys, the OSD and auto-brightness keep working unchanged.
+Only brightness levels and monitor state are read; nothing else is touched.
+"""
+from pathlib import Path
+import json
+import os
+import subprocess
+import time
+
+CONFIG_PATH = Path(os.environ.get('XDG_CONFIG_HOME',Path.home()/'.config'))/'yoga-autobrightness.conf'
+# sdrbrightness at 100% backlight. Calibration knob: hdr_max_sdrbrightness in the config.
+DEFAULT_HDR_MAX = 3.0
+# Backlight 0% is dim, not black; keep HDR from going black at the bottom too.
+HDR_FLOOR = 0.05
+
+def target_level(primary, secondary):
+    level = int((primary/'brightness').read_text())
+    maximum = int((primary/'max_brightness').read_text())
+    other_maximum = int((secondary/'max_brightness').read_text())
+    return round(level*other_maximum/maximum)
+
+def hdr_max():
+    try:
+        for line in CONFIG_PATH.read_text().splitlines():
+            key,_,value = line.partition('=')
+            if key.strip() == 'hdr_max_sdrbrightness': return max(0.1,float(value))
+    except (OSError, ValueError): pass
+    return DEFAULT_HDR_MAX
+
+def sdr_brightness(primary):
+    fraction = int((primary/'brightness').read_text())/int((primary/'max_brightness').read_text())
+    return round(max(HDR_FLOOR,fraction*hdr_max()),3)
+
+def monitor_rule(monitor, brightness):
+    # hl.monitor replaces the whole rule, so rebuild it from the live state:
+    # yoga-mode may have rotated, moved or mirrored the panel.
+    mode = f"{monitor['width']}x{monitor['height']}@{monitor['refreshRate']:.3f}"
+    bitdepth = ', bitdepth = 10' if '2101010' in monitor['currentFormat'] else ''
+    return (f'hl.monitor({{ output = "{monitor["name"]}", mode = "{mode}", position = "{monitor["x"]}x{monitor["y"]}", '
+            f'scale = {monitor["scale"]}, transform = {monitor["transform"]}, mirror = "{monitor["mirrorOf"]}"{bitdepth}, '
+            f'cm = "hdr", sdrbrightness = {brightness} }})')
+
+def sync_hdr(primary):
+    brightness = sdr_brightness(primary)
+    out = subprocess.run(['hyprctl','monitors','-j'],capture_output=True,text=True,check=True,timeout=5).stdout
+    for monitor in json.loads(out):
+        if monitor['name'].startswith('eDP-') and monitor['colorManagementPreset'] == 'hdr' and abs(monitor['sdrBrightness']-brightness) > 0.001:
+            subprocess.run(['hyprctl','eval',monitor_rule(monitor,brightness)],capture_output=True,check=True,timeout=5)
+
+def main():
+    backlights = Path('/sys/class/backlight')
+    primary = backlights/'intel_backlight'
+    failed = False
+    last_level = None
+    last_hdr_check = 0.0
+    while True:
+        try:
+            # DRM card numbering may change with kernel updates.
+            secondary = next(backlights.glob('*-eDP-2-backlight'))
+            target = target_level(primary,secondary)
+            if int((secondary/'brightness').read_text()) != target:
+                subprocess.run(['brightnessctl','-q','-d',secondary.name,'set',str(target)],check=True,timeout=5)
+            # Re-check every 2 s even without a change: yoga-mode or a Hyprland
+            # reload resets the monitor rule and with it sdrbrightness.
+            level = (primary/'brightness').read_text()
+            if level != last_level or time.monotonic()-last_hdr_check > 2:
+                sync_hdr(primary)
+                last_level,last_hdr_check = level,time.monotonic()
+            failed = False
+        except (OSError, ValueError, KeyError, StopIteration, ZeroDivisionError, subprocess.SubprocessError) as error:
+            if not failed:
+                print(f'Waiting for accessible Yoga backlights: {error}',flush=True)
+            failed = True
+        time.sleep(0.3 if not failed else 2)
+
+if __name__ == '__main__':
+    main()
