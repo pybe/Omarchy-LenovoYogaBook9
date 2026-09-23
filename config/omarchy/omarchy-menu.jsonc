@@ -57,6 +57,12 @@
     "action":"yoga-mode present",
     "checked":"[ \"$(yoga-mode status)\" = present ]"
   },
+  "display.tablet": {
+    "icon":"\udb80\udcf6","label":"Tablet",
+    "description":"Folded 360 degrees - lower panel and its touch off",
+    "action":"yoga-mode tablet",
+    "checked":"yoga-mode status | grep -q ^tablet"
+  },
 
   "display.autorotate": {
     "icon":"\udb80\udc68","label":"Auto-rotate",

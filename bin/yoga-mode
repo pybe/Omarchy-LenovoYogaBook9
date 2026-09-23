@@ -39,8 +39,24 @@ apply() {
   fi
 }
 
+# Tablet and stand-on-its-back leave the lower panel facing away or down, so it
+# goes dark and deaf. Every other mode turns it back on: `disabled` persists
+# once set, exactly like `mirror`.
+lower_input() {
+  local dev
+  for dev in touchscreen stylus; do
+    # hl.device replaces the device's whole rule: without output it forgets the
+    # eDP-2 mapping from input.lua, and touches stop reaching the lower panel.
+    apply "hl.device({ name = \"ingenic-gadget-serial-and-keyboard-$dev-bottom\", output = \"eDP-2\", enabled = $1 })" || return 1
+  done
+}
+
 park() {
-  apply "hl.monitor({ output = \"eDP-2\", mode = \"$MODE\", position = \"$PARK\", scale = 2, transform = 0, mirror = \"none\" })"
+  # Only when coming back from tablet. hl.device replaces a device's whole
+  # rule, so re-applying it on every mode switch would silently wipe anything
+  # else input.lua configures for these two devices.
+  if lower_disabled; then lower_input true || return 1; fi
+  apply "hl.monitor({ output = \"eDP-2\", mode = \"$MODE\", position = \"$PARK\", scale = 2, transform = 0, mirror = \"none\", disabled = false })"
 }
 
 mode_stand() {
@@ -75,6 +91,47 @@ mode_present() {
   apply "hl.monitor({ output = \"eDP-1\", mode = \"$MODE\", position = \"0x900\", scale = 2, transform = 0, mirror = \"eDP-2\" })" &&
   apply "hl.monitor({ output = \"eDP-2\", mode = \"$MODE\", position = \"0x0\",   scale = 2, transform = 0, mirror = \"none\" })"
 }
+
+# Workspace id shown on eDP-1, and ids of workspaces on eDP-2 holding windows.
+active_upper() {
+  hyprctl monitors -j | python3 -c "import json,sys
+print(next((m['activeWorkspace']['id'] for m in json.load(sys.stdin) if m['name']=='eDP-1'),''))"
+}
+lower_disabled() {
+  hyprctl monitors all -j | python3 -c "import json,sys
+sys.exit(0 if any(m['name']=='eDP-2' and m['disabled'] for m in json.load(sys.stdin)) else 1)"
+}
+focus_workspace() {
+  [[ -n $1 ]] && apply "hl.dispatch(hl.dsp.focus({ workspace = \"$1\" }))"
+}
+
+# Disabling eDP-2 hands its workspace to eDP-1 and makes it the visible one, so
+# the tablet would open on the lower panel's (usually empty) desktop. Enabling
+# it again sends every workspace back where it came from, and whatever was
+# opened or used in tablet mode lands on the keyboard panel. Keep what the
+# upper panel showed, and gather windowed workspaces onto it on the way out.
+keep_upper_after() {
+  local keep id
+  keep="$(active_upper)"
+  "$@" || return 1
+  for id in $(hyprctl workspaces -j | python3 -c "import json,sys
+print(' '.join(str(w['id']) for w in json.load(sys.stdin) if w['monitor']=='eDP-2' and w['windows'] and w['id']>0))"); do
+    apply "hl.dispatch(hl.dsp.workspace.move({ workspace = \"$id\", monitor = \"eDP-1\" }))"
+  done
+  focus_workspace "$keep"
+}
+
+# Tablet: folded 360 degrees, only the upper panel on. It rotates with the
+# machine; $1 is the eDP-1 transform for how it is held.
+mode_tablet() {
+  apply "hl.monitor({ output = \"eDP-1\", mode = \"$MODE\", position = \"0x0\", scale = 2, transform = $1, mirror = \"none\" })" &&
+  apply "hl.monitor({ output = \"eDP-2\", disabled = true })" &&
+  lower_input false
+}
+tablet_normal()    { mode_tablet 2; }
+tablet_upside()    { mode_tablet 0; }
+tablet_left()      { mode_tablet 3; }
+tablet_right()     { mode_tablet 1; }
 
 current() { cat "$MODE_FILE" 2>/dev/null || echo stand; }
 
@@ -111,9 +168,11 @@ notify() {
 
 # Apply a mode, and only record and announce it if it actually took.
 switch_to() {
-  local name="$1" fn="$2" label="${3:-$1}" wanted_bar
+  local name="$1" fn="$2" label="${3:-$1}" wanted_bar wrap=()
   wanted_bar="$(bar_position)"
-  if ! "$fn"; then
+  # Entering or leaving tablet moves workspaces between panels; see keep_upper_after.
+  if [[ $name == tablet* ]] || lower_disabled; then wrap=(keep_upper_after); fi
+  if ! "${wrap[@]}" "$fn"; then
     echo "failed to switch to $name; layout unchanged" >&2
     return 1
   fi
@@ -127,6 +186,10 @@ stand | laptop)    switch_to stand     mode_stand ;;
 book)              switch_to book      mode_book ;;
 book-flip | book2) switch_to book-flip mode_book_flip "book (other way)" ;;
 present | tent)    switch_to present   mode_present ;;
+tablet)            switch_to tablet    tablet_normal ;;
+tablet-upside)     switch_to tablet-upside tablet_upside tablet ;;
+tablet-left)       switch_to tablet-left   tablet_left   tablet ;;
+tablet-right)      switch_to tablet-right  tablet_right  tablet ;;
 cycle)
   case "$(current)" in
   stand)     exec "$0" book ;;
@@ -137,7 +200,7 @@ cycle)
   ;;
 status) current ;;
 *)
-  echo "usage: ${0##*/} [stand|book|book-flip|present|cycle|status]" >&2
+  echo "usage: ${0##*/} [stand|book|book-flip|present|tablet[-upside|-left|-right]|cycle|status]" >&2
   exit 1
   ;;
 esac

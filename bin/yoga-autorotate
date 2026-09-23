@@ -15,9 +15,18 @@ state the accelerometer reports as bottom-up, not a display preference.
 The hinge sensor would have distinguished a genuine fold from the machine
 merely being tilted, but it reads 0 permanently on this hardware. A stability
 delay stands in for it: an orientation must persist before it is acted on.
+
+Tablet is the one mode orientation cannot see: folded 360 degrees and held up,
+the upper panel reads "normal" exactly as in laptop use. yoga-hinge measures
+the hinge from the two gyroscopes; past TABLET_DEGREES the lower panel faces
+away, so only the upper one stays on and turns with the machine. Upside down
+stays present: tent sits at ~305 degrees against the tablet's 360, and the
+starting angle is only a guess, so the hinge cannot tell those two apart.
+Without yoga-hinge running, tablet is never chosen and the rest behaves as before.
 """
 
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -30,7 +39,20 @@ gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib  # noqa: E402
 
 POLL_SECONDS = 1
-STABLE_READINGS = 4   # ~4s of agreement before acting
+STABLE_READINGS = 4   # ~4s of agreement, standing in for the dead hinge sensor
+HINGE_READINGS = 2    # a live hinge reading rules out an accidental tilt, so half the wait
+TABLET_READINGS = 1   # the hinge already confirms a fold, so tablet in or out is immediate
+
+# yoga-hinge runs as a user service, so its angle lives in the runtime dir.
+HINGE_FILE = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "yoga-hinge"
+TABLET_DEGREES = 250  # laptop ~110, tent ~305 (but upside down), tablet 360
+TABLET_EXIT = 220     # hysteresis, so a tablet resting near the threshold does not flap
+
+TABLET_BY_ORIENTATION = {
+    "normal": "tablet",
+    "left-up": "tablet-left",
+    "right-up": "tablet-right",
+}
 
 ORIENTATION_TO_MODE = {
     "normal": "stand",
@@ -69,6 +91,10 @@ def current_mode():
     if monitors.get("eDP-1", {}).get("mirrorOf", "none") != "none":
         return "present"
 
+    if monitors.get("eDP-2", {}).get("disabled"):
+        transform = monitors.get("eDP-1", {}).get("transform")
+        return {2: "tablet", 0: "tablet-upside", 3: "tablet-left", 1: "tablet-right"}.get(transform)
+
     for name, expected in LAYOUTS.items():
         if all(
             (monitors.get(panel, {}).get("x"),
@@ -78,6 +104,23 @@ def current_mode():
         ):
             return name
     return None
+
+
+def hinge():
+    try:
+        return int(HINGE_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def target_mode(orientation, current):
+    """The mode for this orientation, folded into a tablet when the hinge says so."""
+    angle = hinge()
+    in_tablet = bool(current and current.startswith("tablet"))
+    if orientation != "bottom-up" and angle is not None and angle >= (TABLET_EXIT if in_tablet else TABLET_DEGREES):
+        # Lying flat reports no usable orientation; keep the tablet as it is held.
+        return TABLET_BY_ORIENTATION.get(orientation, current if in_tablet else "tablet")
+    return ORIENTATION_TO_MODE.get(orientation)
 
 
 def apply_mode(mode):
@@ -156,7 +199,8 @@ def main():
                 pass
             continue
 
-        target = ORIENTATION_TO_MODE.get(orientation)
+        current = current_mode()
+        target = target_mode(orientation, current)
         if target is None:
             pending, count = None, 0
             continue
@@ -170,7 +214,17 @@ def main():
         # settled but the layout does not match. `==` here meant a single failed
         # switch -- yoga-mode missing, hyprctl not up yet just after login --
         # was never retried, because count then ran past the value forever.
-        if count >= STABLE_READINGS and target != current_mode():
+        # Without yoga-hinge running there is no hinge reading, and the delay
+        # stays the 4 seconds every other machine has always had: the shorter
+        # wait is only justified by the hinge confirming the fold.
+        folding = target.startswith("tablet") or bool(current and current.startswith("tablet"))
+        if folding:
+            needed = TABLET_READINGS
+        elif hinge() is not None:
+            needed = HINGE_READINGS
+        else:
+            needed = STABLE_READINGS
+        if count >= needed and target != current:
             apply_mode(target)
 
 
