@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""Make the kernel accept the TAS2781 speaker-amp calibration.
+
+The factory calibration lives in the UEFI variable CALI_DATA. On this machine
+it holds two amps' data in the V1 layout (4 x 20-byte slots, timestamp, CRC),
+but the timestamp and CRC fields are zero, so the kernel logs
+"tas2781_apply_calib: V1 CRC error", discards it and the amps run
+uncalibrated. This writes the CRC the kernel expects (crc32 of the first 84
+bytes) into the CRC field and changes nothing else.
+
+  yoga-amp-calib check     show the data and whether the CRC matches
+  yoga-amp-calib fix       back up the variable, then write the CRC (root)
+  yoga-amp-calib restore   write the backup back (root)
+
+Takes effect on the next boot: the driver reads calibration only at probe.
+"""
+import struct
+import subprocess
+import sys
+import zlib
+from pathlib import Path
+
+VAR = Path('/sys/firmware/efi/efivars/CALI_DATA-1f52d2a1-bb3a-457d-bc09-43a3f4310a92')
+BACKUP = Path.home()/'.local/state/yoga-book/CALI_DATA.orig'
+
+
+def read():
+    raw = VAR.read_bytes()
+    return raw[:4], raw[4:]
+
+
+def expected_crc(data):
+    return zlib.crc32(data[:84]) & 0xffffffff
+
+
+def check():
+    _attrs, data = read()
+    words = struct.unpack('<22I', data[:88])
+    for dev in range(4):
+        print(f'amp {dev}:', ' '.join(f'{w:08x}' for w in words[dev*5:dev*5+5]))
+    stored, want = words[21], expected_crc(data)
+    print(f'timestamp {words[20]:08x}  crc stored {stored:08x}  expected {want:08x}')
+    print('OK: kernel will apply calibration' if stored == want else 'MISMATCH: kernel discards calibration')
+    return stored == want
+
+
+def root_write(payload):
+    # efivarfs marks variables immutable; lift it only for this write.
+    # The +i must go back on even if the write fails, or the variable is left
+    # writable by anything running as root.
+    script = ('import sys,subprocess;p=sys.argv[1];subprocess.run(["chattr","-i",p],check=True)\n'
+              'try:\n'
+              '    f=open(p,"wb");f.write(sys.stdin.buffer.read());f.close()\n'
+              'finally:\n'
+              '    subprocess.run(["chattr","+i",p],check=False)')
+    elevate = ['sudo'] if sys.stdin.isatty() else ['pkexec']
+    subprocess.run([*elevate, 'python3', '-c', script, str(VAR)], input=payload, check=True)
+
+
+def fix():
+    if check():
+        return
+    attrs, data = read()
+    words = struct.unpack('<22I', data[:88])
+    if not any(words[:5]) or words[0] == 2781:
+        sys.exit('Unexpected layout (empty or V2+); refusing to write')
+    if not BACKUP.exists():
+        BACKUP.parent.mkdir(parents=True, exist_ok=True)
+        BACKUP.write_bytes(attrs+data)
+        print('Backup:', BACKUP)
+    patched = data[:84]+struct.pack('<I', expected_crc(data))+data[88:]
+    root_write(attrs+patched)
+    check()
+    print('Reboot to apply.')
+
+
+def restore():
+    if not BACKUP.exists():
+        sys.exit('No backup at '+str(BACKUP))
+    root_write(BACKUP.read_bytes())
+    check()
+
+
+if __name__ == '__main__':
+    action = sys.argv[1] if len(sys.argv) > 1 else 'check'
+    {'check': check, 'fix': fix, 'restore': restore}.get(action, lambda: sys.exit(__doc__))()

@@ -181,7 +181,7 @@ amixer -c 0 cset numid=7 off    # Speaker (0x17) off
 amixer -c 0 cset numid=9 on     # Bass Speaker (0x14) on
 ```
 
-Total silence means the woofers are getting nothing. Turn `numid=7` back on afterwards.
+Total silence means the woofers are getting nothing. Turn `numid=7` back on afterwards, or run [`bin/yoga-speaker-test`](bin/yoga-speaker-test), which steps through both pins and each one alone and switches both back on when it exits.
 
 Everything in the mixer looks correct, which is what makes this confusing: `Bass Speaker Playback Switch` is on, `DAC2 Playback Volume` is at maximum, the pin has `Pin-ctls: 0x40: OUT` and EAPD asserted. The problem is upstream of the mixer.
 
@@ -208,7 +208,29 @@ So the workaround below is not a stopgap awaiting something better — it is the
 > Node 0x03 [Audio Output]    Converter: stream=1, channel=0   <- tweeters
 > ```
 >
-> First reported in PR #14, and confirmed here. What is **not** reconciled yet is the mute test above, which gave silence from the woofer pin alone. It was run before this machine's amp calibration CRC was repaired on 2026-08-25 (see [Speaker amp calibration fails](#speaker-amp-calibration-fails); PR #14 proposes the repair as a script), which may or may not account for it. Until that is settled, treat the root-cause analysis above as unproven on SOF, and do not install `51-yoga-bass-speakers.conf` there. It stays in the repo for machines on the legacy `snd_hda_intel` driver, where it has not been tested either.
+> First reported in PR #14, and confirmed here.
+>
+> **The mute test does not reproduce (2026-09-23).** Re-run on SOF with the calibration applied, playing a tone of 60 Hz and 2500 Hz mixed at equal level, the result is the opposite of the one above:
+>
+> | mixer state | what plays |
+> |---|---|
+> | `numid=7 off`, `numid=9 on` — woofer pin `0x14` alone | full range, both tones, no drop in level |
+> | `numid=7 on`, `numid=9 off` — tweeter pin `0x17` alone | audibly quieter, the 60 Hz half largely gone |
+>
+> The first row is exactly the test above, and it gives **full sound rather than silence**. So `0x14` is fed, and the premise of the root-cause section — that a stereo stream reaches one DAC pair and the woofers receive nothing — does not hold on this driver. It is consistent with both converters carrying `stream=1` at `Amp-Out vals: [0x57 0x57]`. The second row is what a tweeter alone should sound like on a tone that is half bass.
+>
+> **The two pins are not equivalent outputs, and the codec says so.** Only `0x14` drives an external amplifier:
+>
+> ```
+> Node 0x14  Pincap 0x00010014: OUT EAPD Detect      EAPD 0x2: EAPD   <- powers the TAS2781s
+> Node 0x17  Pincap 0x0000001c: OUT HP Detect                         <- no EAPD at all
+> ```
+>
+> So `0x14` is the amplified path and `0x17` is a bare codec output. That is why `0x17` alone is quieter, on a pure 2.5 kHz tone played straight to the hardware sink with the EQ bypassed as well as on programme material — expected behaviour, not a fault.
+>
+> It also explains the original silent result, which was recorded before the calibration CRC was repaired (see [Speaker amp calibration fails](#speaker-amp-calibration-fails)). Uncalibrated TAS2781s run a conservative protection model and give very little output, so leaving only `0x14` — the amplified path — left almost nothing audible, while `0x17` kept playing because it needs no amplifier. Hence "the woofers are never fed". With the calibration applied the relationship inverts, which is what the table above measures.
+>
+> Treat the root-cause analysis above as **disproven on SOF**, and do not install `51-yoga-bass-speakers.conf` there. It stays in the repo for machines on the legacy `snd_hda_intel` driver, where it has not been tested either.
 
 ### Fix (legacy `snd_hda_intel` only — not needed on SOF)
 
@@ -616,6 +638,12 @@ install -Dm644 config/pipewire/62-yoga-dolby-eq.conf \
   ~/.config/pipewire/pipewire.conf.d/62-yoga-dolby-eq.conf
 install -Dm755 bin/yoga-volume ~/.local/bin/yoga-volume
 systemctl --user restart pipewire pipewire-pulse wireplumber
+
+# Speaker amp calibration: repair the zeroed CRC so the kernel stops
+# discarding it (one-off, takes effect on the next boot).
+install -Dm755 bin/yoga-amp-calib ~/.local/bin/yoga-amp-calib
+install -Dm755 bin/yoga-speaker-test ~/.local/bin/yoga-speaker-test
+yoga-amp-calib fix
 wpctl set-default $(pw-dump | jq -r '.[]|select(.info.props."node.name"?=="yoga_dolby")|.id')
 
 # Emulated touchpad: drop the phantom right button (root-owned path; libinput
@@ -821,7 +849,24 @@ The TAS2781 smart amp rejects its calibration at every boot on a stock install. 
 
 **The cause is a zeroed checksum, and it is repairable.** The calibration lives in the UEFI variable `CALI_DATA-1f52d2a1-bb3a-457d-bc09-43a3f4310a92`: 128 bytes holding real data for two amps in the kernel's V1 layout — four 20-byte slots, a timestamp at byte 80 and a CRC at byte 84. Both the timestamp and the CRC are zero as shipped. The kernel checks `crc32(~0, data, 84) ^ ~0` against the CRC field (`tas2781_apply_calib` in `sound/hda/codecs/side-codecs/tas2781_hda.c`), so it discards the data.
 
-On this machine the correct CRC was written into the variable on 2026-08-25, with the original kept at `/root/CALI_DATA.original.bin`. The `V1 CRC error` has not appeared in any kernel log since. Whether that audibly changed the sound was never cleanly compared. PR #14 proposes the same repair as a script with a backup and a `restore` command.
+On this machine the correct CRC was written into the variable on 2026-08-25, with the original kept at `/root/CALI_DATA.original.bin`. The `V1 CRC error` has not appeared in any kernel log since.
+
+**[`bin/yoga-amp-calib`](bin/yoga-amp-calib) does the same repair reproducibly**, computing exactly the CRC the kernel checks and touching nothing else:
+
+```bash
+yoga-amp-calib check      # print both amps' slots, the stored CRC and the expected one
+yoga-amp-calib fix        # back the variable up, then write the CRC field (root)
+yoga-amp-calib restore    # write the backup back
+```
+
+`fix` copies the whole variable, attributes included, to `~/.local/state/yoga-book/CALI_DATA.orig` before its first write, and refuses to touch a variable whose layout is not the V1 one it expects. efivarfs marks the variable immutable; the script lifts `chattr -i` only for the write and puts it back even if the write fails. The driver reads calibration at probe, so it takes effect on the next boot:
+
+```bash
+yoga-amp-calib check                       # expect "OK: kernel will apply calibration"
+sudo dmesg | grep tas2781_apply_calib      # expect nothing after a reboot
+```
+
+Whether the repair audibly changed the sound has not been cleanly A/B'd on this machine, and **whether Windows minds the now-populated CRC field is untested** — hence the backup and `restore`.
 
 The loaded topology is also the generic fallback rather than anything machine-specific:
 
