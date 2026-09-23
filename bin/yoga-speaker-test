@@ -1,0 +1,15 @@
+#!/bin/bash
+# Which physical speakers make sound? Play music, run this, listen.
+# Speaker Playback Switch (numid=7) drives pin 0x17, Bass Speaker Playback
+# Switch (numid=9) drives pin 0x14. Both are switched back on at the end.
+set -uo pipefail
+STEP="${1:-8}"
+[[ $STEP =~ ^[0-9]+$ ]] || { echo "usage: ${0##*/} [seconds per step]" >&2; exit 1; }
+sw() { amixer -c 0 cset numid="$1" "$2" >/dev/null; }
+say() { echo "$1"; notify-send -t $((STEP * 1000)) "Speaker test" "$1"; }
+restore() { sw 7 on; sw 9 on; say "Done, both pins back on"; }
+# EXIT alone: bash runs it on Ctrl+C too, so the cleanup cannot run twice.
+trap restore EXIT
+say "1/3 Both (as usual)";                 sw 7 on;  sw 9 on;  sleep "$STEP"
+say "2/3 Pin 0x17 only (Speaker)";         sw 7 on;  sw 9 off; sleep "$STEP"
+say "3/3 Pin 0x14 only (Bass Speaker)";    sw 7 off; sw 9 on;  sleep "$STEP"

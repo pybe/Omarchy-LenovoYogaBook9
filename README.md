@@ -181,7 +181,7 @@ amixer -c 0 cset numid=7 off    # Speaker (0x17) off
 amixer -c 0 cset numid=9 on     # Bass Speaker (0x14) on
 ```
 
-Total silence means the woofers are getting nothing. Turn `numid=7` back on afterwards.
+Total silence means the woofers are getting nothing. Turn `numid=7` back on afterwards, or run [`bin/yoga-speaker-test`](bin/yoga-speaker-test), which steps through both pins and each one alone and switches both back on when it exits.
 
 Everything in the mixer looks correct, which is what makes this confusing: `Bass Speaker Playback Switch` is on, `DAC2 Playback Volume` is at maximum, the pin has `Pin-ctls: 0x40: OUT` and EAPD asserted. The problem is upstream of the mixer.
 
@@ -616,6 +616,18 @@ install -Dm644 config/pipewire/62-yoga-dolby-eq.conf \
   ~/.config/pipewire/pipewire.conf.d/62-yoga-dolby-eq.conf
 install -Dm755 bin/yoga-volume ~/.local/bin/yoga-volume
 systemctl --user restart pipewire pipewire-pulse wireplumber
+
+# Speaker amp calibration: repair the zeroed CRC so the kernel stops
+# discarding it (one-off, takes effect on the next boot).
+install -Dm755 bin/yoga-amp-calib ~/.local/bin/yoga-amp-calib
+install -Dm755 bin/yoga-speaker-test ~/.local/bin/yoga-speaker-test
+yoga-amp-calib fix
+
+# ...and keep the speaker PCM open, or the amps drop that calibration on the
+# first close/open cycle.
+install -Dm644 config/wireplumber/52-yoga-speakers-keep-open.conf \
+  ~/.config/wireplumber/wireplumber.conf.d/52-yoga-speakers-keep-open.conf
+systemctl --user restart wireplumber
 wpctl set-default $(pw-dump | jq -r '.[]|select(.info.props."node.name"?=="yoga_dolby")|.id')
 
 # Emulated touchpad: drop the phantom right button (root-owned path; libinput
@@ -821,7 +833,37 @@ The TAS2781 smart amp rejects its calibration at every boot on a stock install. 
 
 **The cause is a zeroed checksum, and it is repairable.** The calibration lives in the UEFI variable `CALI_DATA-1f52d2a1-bb3a-457d-bc09-43a3f4310a92`: 128 bytes holding real data for two amps in the kernel's V1 layout — four 20-byte slots, a timestamp at byte 80 and a CRC at byte 84. Both the timestamp and the CRC are zero as shipped. The kernel checks `crc32(~0, data, 84) ^ ~0` against the CRC field (`tas2781_apply_calib` in `sound/hda/codecs/side-codecs/tas2781_hda.c`), so it discards the data.
 
-On this machine the correct CRC was written into the variable on 2026-08-25, with the original kept at `/root/CALI_DATA.original.bin`. The `V1 CRC error` has not appeared in any kernel log since. Whether that audibly changed the sound was never cleanly compared. PR #14 proposes the same repair as a script with a backup and a `restore` command.
+On this machine the correct CRC was written into the variable on 2026-08-25, with the original kept at `/root/CALI_DATA.original.bin`. The `V1 CRC error` has not appeared in any kernel log since.
+
+**[`bin/yoga-amp-calib`](bin/yoga-amp-calib) does the same repair reproducibly**, computing exactly the CRC the kernel checks and touching nothing else:
+
+```bash
+yoga-amp-calib check      # print both amps' slots, the stored CRC and the expected one
+yoga-amp-calib fix        # back the variable up, then write the CRC field (root)
+yoga-amp-calib restore    # write the backup back
+```
+
+`fix` copies the whole variable, attributes included, to `~/.local/state/yoga-book/CALI_DATA.orig` before its first write, and refuses to touch a variable whose layout is not the V1 one it expects. efivarfs marks the variable immutable; the script lifts `chattr -i` only for the write and puts it back even if the write fails. The driver reads calibration at probe, so it takes effect on the next boot:
+
+```bash
+yoga-amp-calib check                       # expect "OK: kernel will apply calibration"
+sudo dmesg | grep tas2781_apply_calib      # expect nothing after a reboot
+```
+
+Whether the repair audibly changed the sound has not been cleanly A/B'd on this machine, and **whether Windows minds the now-populated CRC field is untested** — hence the backup and `restore`.
+
+**The repaired calibration is dropped again on the first PCM close/open.** `tas2781_hda_playback_hook` runs the amp's shutdown block on `HDA_GEN_PCM_ACT_CLOSE` and its power-up block on `OPEN`, but the calibration is only rewritten when the DSP *configuration number* changes — `tasdevice_select_tuningprm_cfg` otherwise logs `Unneeded loading dsp conf` and returns. So the amps come back from the second open uncalibrated. WirePlumber suspends an idle sink after 5 s, which closes the PCM, so restarting a browser was enough to lose the effect until the next boot.
+
+**Nothing short of a reboot brings it back.** Once the amps have lost the calibration, toggling `Speaker Config Id` does not restore it, and neither does `Speaker Profile Id`:
+
+```bash
+amixer -c0 cset numid=5 1; amixer -c0 cset numid=5 0   # Speaker Config Id  -- no effect
+amixer -c0 cset numid=1 1; amixer -c0 cset numid=1 0   # Speaker Profile Id -- no effect
+```
+
+Tested on 2026-09-23 with a tone playing and the PCM open, after the calibration had been lost to four close/open cycles: the low end did not come back from either toggle, and did come back after a reboot. Nothing about it is visible from the HDA side — `/proc/asound/card0/codec#0` is byte-identical either way, both DACs carry the stream at `[0x57 0x57]` and both pins are open — so the only signal that the amps are running uncalibrated is that they sound thin. The driver writes the calibration at probe, so **a reboot is the only recovery**, which is what makes the config below worth its battery cost rather than a convenience.
+
+[`config/wireplumber/52-yoga-speakers-keep-open.conf`](config/wireplumber/52-yoga-speakers-keep-open.conf) avoids the cycle instead, setting `session.suspend-timeout-seconds = 0` on the speaker sink so the PCM is never closed. That keeps the codec and the amps powered whenever the machine is awake; measured against an idle suspended sink, the cost is about **350 mW**, on an idle desktop drawing roughly 8 W: 8.40 W with the PCM held open against 8.04 W with it suspended (90 samples each, two alternating rounds; the difference came out at 293 mW and 439 mW, and per-sample spread is +/-0.3 W, so treat it as a few hundred mW rather than a precise figure). On this 69 Wh battery that is roughly 20 minutes of idle runtime, 4-5%. Runtime PM of the amps is **not** part of this: with the PCM held open they stay `active` anyway, and no udev rule is needed.
 
 The loaded topology is also the generic fallback rather than anything machine-specific:
 
